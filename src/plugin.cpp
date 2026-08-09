@@ -46,7 +46,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.1"
+#define PLUGIN_VERSION "1.2"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -690,9 +690,9 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_START, "Talk-poke: Arm");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_STOP,  "Talk-poke: Disarm");
     /* Right-click a CHANNEL -> everyone in it */
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_MOVE_START_CH,  "Random Move everyone here");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke everyone here");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_CHAOS_START_CH, "Chaos everyone here");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_MOVE_START_CH,  "Random Move: Start (everyone here)");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke: Start (everyone here)");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_CHAOS_START_CH, "Chaos (move + poke): Start (everyone here)");
     /* Global plugin menu */
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SETTINGS,       "Settings...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_HARDSTOP,       "HARD STOP - stop everything");
