@@ -56,6 +56,9 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 - **Poke: Start / Stop**
 - **Chaos (move + poke): Start / Stop** — both at once
 - **Talk-poke: Arm / Disarm** — pokes them every time they start talking
+- **Talk-move: Arm / Disarm** — moves them to another channel every time they start
+  talking (follows your "no empty channel" setting, but never prompts mid-talk — it
+  just skips the move if there's nowhere to send them)
 
 **Right-click a CHANNEL** (group actions on everyone in it):
 - **Random Move / Poke / Chaos everyone here**

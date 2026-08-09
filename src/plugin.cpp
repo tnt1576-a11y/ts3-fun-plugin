@@ -46,7 +46,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.2"
+#define PLUGIN_VERSION "1.3"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -60,6 +60,8 @@ enum {
     MENU_CHAOS_STOP,
     MENU_TALKPOKE_START,
     MENU_TALKPOKE_STOP,
+    MENU_TALKMOVE_START,
+    MENU_TALKMOVE_STOP,
     MENU_MOVE_START_CH,   /* channel menu: everyone in the channel */
     MENU_POKE_START_CH,
     MENU_CHAOS_START_CH,
@@ -96,8 +98,10 @@ static CRITICAL_SECTION cs;   /* guards job start/stop + shared reaction state *
 
 /* Reaction state (guarded by cs) */
 static std::set<anyID>          talkTargets;      /* users armed for talk-poke  */
+static std::set<anyID>          talkMoveTargets;  /* users armed for talk-move  */
 static std::map<anyID, DWORD>   pokeBackCooldown; /* last auto-poke-back tick    */
 static std::map<anyID, DWORD>   talkCooldown;     /* last talk-poke tick         */
+static std::map<anyID, DWORD>   talkMoveCooldown; /* last talk-move tick         */
 
 static void setDefaults() {
     g.moveIntervalMs   = 5000;
@@ -473,10 +477,11 @@ static void hardStop() {
     stopAllJobs();
     EnterCriticalSection(&cs);
     talkTargets.clear();      /* disarm every talk-poke target */
+    talkMoveTargets.clear();  /* disarm every talk-move target */
     g.autoPokeBack = 0;       /* stop reacting to incoming pokes */
     LeaveCriticalSection(&cs);
     ts3Functions.printMessageToCurrentTab(
-        "[Fun Plugin] HARD STOP: all jobs stopped, talk-poke disarmed, auto-poke-back turned off.");
+        "[Fun Plugin] HARD STOP: all jobs stopped, talk-poke/talk-move disarmed, auto-poke-back turned off.");
 }
 
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
@@ -647,8 +652,10 @@ void ts3plugin_shutdown() {
     stopAllJobs();
     EnterCriticalSection(&cs);
     talkTargets.clear();
+    talkMoveTargets.clear();
     pokeBackCooldown.clear();
     talkCooldown.clear();
+    talkMoveCooldown.clear();
     LeaveCriticalSection(&cs);
     DeleteCriticalSection(&cs);
     if (pluginID) {
@@ -677,7 +684,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 13;
+    const int count = 15;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -689,6 +696,8 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_CHAOS_STOP,     "Chaos (move + poke): Stop");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_START, "Talk-poke: Arm");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_STOP,  "Talk-poke: Disarm");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKMOVE_START, "Talk-move: Arm");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKMOVE_STOP,  "Talk-move: Disarm");
     /* Right-click a CHANNEL -> everyone in it */
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_MOVE_START_CH,  "Random Move: Start (everyone here)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke: Start (everyone here)");
@@ -743,6 +752,22 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
             talkTargets.erase(clientTarget);
             LeaveCriticalSection(&cs);
             ts3Functions.printMessageToCurrentTab("[Fun Plugin] Talk-poke disarmed for the selected user.");
+        }
+        break;
+    case MENU_TALKMOVE_START:
+        if (type == PLUGIN_MENU_TYPE_CLIENT) {
+            EnterCriticalSection(&cs);
+            talkMoveTargets.insert(clientTarget);
+            LeaveCriticalSection(&cs);
+            ts3Functions.printMessageToCurrentTab("[Fun Plugin] Talk-move armed: this user gets moved whenever they talk.");
+        }
+        break;
+    case MENU_TALKMOVE_STOP:
+        if (type == PLUGIN_MENU_TYPE_CLIENT) {
+            EnterCriticalSection(&cs);
+            talkMoveTargets.erase(clientTarget);
+            LeaveCriticalSection(&cs);
+            ts3Functions.printMessageToCurrentTab("[Fun Plugin] Talk-move disarmed for the selected user.");
         }
         break;
 
@@ -801,21 +826,39 @@ void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int sta
     (void)isReceivedWhisper;
     if (status != STATUS_TALKING) return;
 
-    bool ok = false;
-    int times = 0;
+    bool doPoke = false;
+    int  times  = 0;
+    bool doMove = false;
+    int  moveAll = 0;
+    DWORD now = GetTickCount();
+
     EnterCriticalSection(&cs);
     if (talkTargets.count(clientID)) {
-        DWORD now = GetTickCount();
         DWORD last = talkCooldown[clientID];
         if ((last == 0) || ((now - last) > 1000)) {   /* at most one burst/sec per user */
-            ok = true;
+            doPoke = true;
             talkCooldown[clientID] = now;
             times = g.talkPokeTimes;
         }
     }
+    if (talkMoveTargets.count(clientID)) {
+        DWORD last = talkMoveCooldown[clientID];
+        if ((last == 0) || ((now - last) > 1000)) {
+            doMove = true;
+            talkMoveCooldown[clientID] = now;
+            moveAll = (g.noEmptyMode == NE_ALL) ? 1 : 0;   /* same setting; never prompts here */
+        }
+    }
     LeaveCriticalSection(&cs);
 
-    if (ok) pokeTimes(serverConnectionHandlerID, clientID, times);
+    if (doPoke) pokeTimes(serverConnectionHandlerID, clientID, times);
+    if (doMove) {
+        Job tmp{};                     /* transient single-target job, reuses doOneMove */
+        tmp.sch = serverConnectionHandlerID;
+        tmp.targets.push_back(clientID);
+        tmp.allChannels = moveAll;
+        doOneMove(&tmp);
+    }
 }
 
 /* ------------------------------------------------------------------ */
