@@ -23,9 +23,15 @@
 /* Global */
 #define IDC_LIMITER         1020  /* edit: auto-stop after N seconds (0=off) */
 
+/* Reactions */
+#define IDC_AUTOPOKEBACK    1030  /* checkbox: poke back when poked          */
+#define IDC_APB_TIMES       1031  /* edit: pokes per auto-poke-back          */
+#define IDC_TALK_TIMES      1032  /* edit: pokes per talk trigger            */
+
 /* Static labels (no logic, just layout) */
 #define IDC_LBL_MOVE        1100
 #define IDC_LBL_POKE        1101
 #define IDC_LBL_GLOBAL      1102
+#define IDC_LBL_REACT       1103
 
 #endif /* FUNPLUGIN_RESOURCE_H */

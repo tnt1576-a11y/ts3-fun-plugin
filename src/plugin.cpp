@@ -1,13 +1,17 @@
 /*
  * Fun Plugin for TeamSpeak 3 (client-side, 64-bit)
  *
- * Two features, both driven from the right-click menu on a user:
- *   1) Random Move - keep moving a user into a random EMPTY channel on an interval.
- *   2) Poke        - keep poking a user with a custom or random message on a delay.
+ * Features, driven from the right-click menus:
+ *   - Random Move  : keep moving target(s) into random empty channels on a timer.
+ *   - Poke         : keep poking target(s) with a custom/random/gibberish message.
+ *   - Chaos        : move + poke at once.
+ *   - Group actions: right-click a CHANNEL to hit everyone in it at once.
+ *   - Talk-poke    : arm a user so they get poked whenever they start talking.
+ *   - Auto-poke-back: (setting) poke people back automatically when they poke you.
+ *   - Limiter      : auto-stop after N seconds.
+ *   - HARD STOP    : global panic button.
  *
- * Plus a global "HARD STOP" that halts everything and a native Settings dialog.
- *
- * Written for your own server where you are the owner (permissions are not an issue).
+ * For your own server where you are the owner (permissions are not an issue).
  */
 
 #include <windows.h>
@@ -17,6 +21,8 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <map>
+#include <set>
 
 #include "teamspeak/public_errors.h"
 #include "teamspeak/public_definitions.h"
@@ -40,9 +46,9 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.0"
+#define PLUGIN_VERSION "1.1"
 #define PLUGIN_AUTHOR  "kingtnt"
-#define PLUGIN_DESC    "Random-move and poke your friends for fun."
+#define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
 /* Menu item ids */
 enum {
@@ -52,6 +58,11 @@ enum {
     MENU_POKE_STOP,
     MENU_CHAOS_START,
     MENU_CHAOS_STOP,
+    MENU_TALKPOKE_START,
+    MENU_TALKPOKE_STOP,
+    MENU_MOVE_START_CH,   /* channel menu: everyone in the channel */
+    MENU_POKE_START_CH,
+    MENU_CHAOS_START_CH,
     MENU_SETTINGS,
     MENU_HARDSTOP
 };
@@ -73,21 +84,32 @@ struct Settings {
     int  pokeMode;         /* PM_CUSTOM / PM_RANDOM / PM_RANDCHARS */
     int  randCharLen;      /* length for PM_RANDCHARS    */
     int  limiterSec;       /* auto-stop after N seconds; 0 = no limit */
+    int  autoPokeBack;     /* 0/1: poke back when poked  */
+    int  autoPokeBackTimes;/* pokes per auto-poke-back   */
+    int  talkPokeTimes;    /* pokes each time a watched user starts talking */
     char customMsg[256];
     std::vector<std::string> randomMsgs;
 };
 
 static Settings g;
-static CRITICAL_SECTION cs;   /* guards job start/stop + settings access */
+static CRITICAL_SECTION cs;   /* guards job start/stop + shared reaction state */
+
+/* Reaction state (guarded by cs) */
+static std::set<anyID>          talkTargets;      /* users armed for talk-poke  */
+static std::map<anyID, DWORD>   pokeBackCooldown; /* last auto-poke-back tick    */
+static std::map<anyID, DWORD>   talkCooldown;     /* last talk-poke tick         */
 
 static void setDefaults() {
-    g.moveIntervalMs  = 5000;
-    g.noEmptyMode     = NE_ASK;
-    g.autoCreateTemp  = 0;
-    g.pokeDelayMs     = 3000;
-    g.pokeMode        = PM_CUSTOM;
-    g.randCharLen     = 8;
-    g.limiterSec      = 0;
+    g.moveIntervalMs   = 5000;
+    g.noEmptyMode      = NE_ASK;
+    g.autoCreateTemp   = 0;
+    g.pokeDelayMs      = 3000;
+    g.pokeMode         = PM_CUSTOM;
+    g.randCharLen      = 8;
+    g.limiterSec       = 0;
+    g.autoPokeBack     = 0;
+    g.autoPokeBackTimes= 3;
+    g.talkPokeTimes    = 1;
     strcpy(g.customMsg, "stop ignoring me!");
     g.randomMsgs.clear();
     g.randomMsgs.push_back("boo!");
@@ -111,13 +133,16 @@ static void loadSettings() {
     getIniPath(ini, sizeof(ini));
     if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) return;  /* keep defaults */
 
-    g.moveIntervalMs  = GetPrivateProfileIntA("move", "intervalMs", g.moveIntervalMs, ini);
-    g.noEmptyMode     = GetPrivateProfileIntA("move", "noEmptyMode", g.noEmptyMode, ini);
-    g.autoCreateTemp  = GetPrivateProfileIntA("move", "autoCreate",  g.autoCreateTemp, ini);
-    g.pokeDelayMs     = GetPrivateProfileIntA("poke", "delayMs",    g.pokeDelayMs, ini);
-    g.pokeMode        = GetPrivateProfileIntA("poke", "mode",        g.pokeMode, ini);
-    g.randCharLen     = GetPrivateProfileIntA("poke", "randLen",    g.randCharLen, ini);
-    g.limiterSec      = GetPrivateProfileIntA("limiter", "seconds", g.limiterSec, ini);
+    g.moveIntervalMs   = GetPrivateProfileIntA("move", "intervalMs", g.moveIntervalMs, ini);
+    g.noEmptyMode      = GetPrivateProfileIntA("move", "noEmptyMode", g.noEmptyMode, ini);
+    g.autoCreateTemp   = GetPrivateProfileIntA("move", "autoCreate",  g.autoCreateTemp, ini);
+    g.pokeDelayMs      = GetPrivateProfileIntA("poke", "delayMs",    g.pokeDelayMs, ini);
+    g.pokeMode         = GetPrivateProfileIntA("poke", "mode",        g.pokeMode, ini);
+    g.randCharLen      = GetPrivateProfileIntA("poke", "randLen",    g.randCharLen, ini);
+    g.limiterSec       = GetPrivateProfileIntA("limiter", "seconds", g.limiterSec, ini);
+    g.autoPokeBack     = GetPrivateProfileIntA("react", "autoPokeBack",  g.autoPokeBack, ini);
+    g.autoPokeBackTimes= GetPrivateProfileIntA("react", "autoPokeBackTimes", g.autoPokeBackTimes, ini);
+    g.talkPokeTimes    = GetPrivateProfileIntA("react", "talkPokeTimes", g.talkPokeTimes, ini);
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
 
     int count = GetPrivateProfileIntA("poke", "randomCount", -1, ini);
@@ -155,8 +180,13 @@ static void saveSettings() {
     _snprintf(num, sizeof(num), "%d", g.limiterSec);
     WritePrivateProfileStringA("limiter", "seconds", num, ini);
 
-    /* clear any stale keys, then rewrite the list */
-    WritePrivateProfileStringA("poke_random", NULL, NULL, ini);
+    _snprintf(num, sizeof(num), "%d", g.autoPokeBack);
+    WritePrivateProfileStringA("react", "autoPokeBack", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.autoPokeBackTimes);
+    WritePrivateProfileStringA("react", "autoPokeBackTimes", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.talkPokeTimes);
+    WritePrivateProfileStringA("react", "talkPokeTimes", num, ini);
+
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
     WritePrivateProfileStringA("poke", "randomCount", num, ini);
     for (size_t i = 0; i < g.randomMsgs.size(); ++i) {
@@ -167,18 +197,48 @@ static void saveSettings() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Job engine                                                         */
+/* Message helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+static std::string randomChars(int n) {
+    static const char cs_[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    if (n < 1)   n = 1;
+    if (n > 100) n = 100;
+    std::string s;
+    s.reserve(n);
+    for (int i = 0; i < n; ++i) s += cs_[rand() % (sizeof(cs_) - 1)];
+    return s;
+}
+
+static std::string pickPokeMessage() {
+    if (g.pokeMode == PM_RANDOM && !g.randomMsgs.empty())
+        return g.randomMsgs[rand() % g.randomMsgs.size()];
+    if (g.pokeMode == PM_RANDCHARS)
+        return randomChars(g.randCharLen);
+    return g.customMsg;
+}
+
+static void pokeTimes(uint64 sch, anyID target, int times) {
+    for (int i = 0; i < times; ++i) {
+        std::string m = pickPokeMessage();
+        ts3Functions.requestClientPoke(sch, target, m.c_str(), NULL);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Job engine (multi-target)                                          */
 /* ------------------------------------------------------------------ */
 
 struct Job {
     volatile LONG active;
     HANDLE  thread;
-    HANDLE  stopEvent;   /* manual-reset; signalled to stop            */
-    uint64  sch;         /* server connection handler id               */
-    anyID   target;      /* the victim client id                       */
-    int     allChannels; /* move: 1 = allowed to use non-empty channels */
-    int     intervalMs;  /* snapshot of the interval for this run       */
-    int     limiterMs;   /* snapshot of auto-stop time; 0 = no limit    */
+    HANDLE  stopEvent;         /* manual-reset; signalled to stop    */
+    uint64  sch;               /* server connection handler id       */
+    std::vector<anyID> targets;/* one or many victims                */
+    int     allChannels;       /* move: 1 = may use non-empty channels */
+    int     intervalMs;        /* snapshot of the interval for this run */
+    int     limiterMs;         /* snapshot of auto-stop time; 0 = none  */
 };
 
 static Job moveJob;
@@ -198,8 +258,8 @@ static void stopJob(Job& j) {
     InterlockedExchange(&j.active, 0);
 }
 
-static void startJob(Job& j, LPTHREAD_START_ROUTINE fn) {
-    stopJob(j);   /* replace any existing run cleanly */
+/* create the stop event + worker thread (caller must have stopped any prior run) */
+static void launchJob(Job& j, LPTHREAD_START_ROUTINE fn) {
     j.stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     InterlockedExchange(&j.active, 1);
     j.thread = CreateThread(NULL, 0, fn, &j, 0, NULL);
@@ -207,7 +267,7 @@ static void startJob(Job& j, LPTHREAD_START_ROUTINE fn) {
 
 /* interruptible sleep; returns true if we were told to stop */
 static bool sleepOrStop(Job* j, int ms) {
-    if (ms < 50) ms = 50;   /* backstop; the real floor is applied on input */
+    if (ms < 5) ms = 5;   /* backstop; the real floor is applied on input */
     return WaitForSingleObject(j->stopEvent, ms) == WAIT_OBJECT_0;
 }
 
@@ -217,19 +277,34 @@ static bool limitReached(Job* j, DWORD startTick) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Channel helpers                                                    */
+/* Channel / client helpers                                           */
 /* ------------------------------------------------------------------ */
 
-/* returns true if at least one channel (other than the target's own) is empty */
-static bool hasEmptyChannel(uint64 sch, anyID target) {
-    uint64 cur = 0;
-    ts3Functions.getChannelOfClient(sch, target, &cur);
+static anyID ownClient(uint64 sch) {
+    anyID me = 0;
+    ts3Functions.getClientID(sch, &me);
+    return me;
+}
+
+/* clients in a channel, excluding ourselves */
+static std::vector<anyID> clientsInChannel(uint64 sch, uint64 channelID) {
+    std::vector<anyID> v;
+    anyID me = ownClient(sch);
+    anyID* arr = NULL;
+    if (ts3Functions.getChannelClientList(sch, channelID, &arr) == ERROR_ok && arr) {
+        for (int i = 0; arr[i]; ++i)
+            if (arr[i] != me) v.push_back(arr[i]);
+        ts3Functions.freeMemory(arr);
+    }
+    return v;
+}
+
+/* true if at least one channel on the server currently has zero clients */
+static bool hasAnyEmptyChannel(uint64 sch) {
     uint64* channels = NULL;
     if (ts3Functions.getChannelList(sch, &channels) != ERROR_ok || !channels) return false;
-
     bool found = false;
     for (int i = 0; channels[i] && !found; ++i) {
-        if (channels[i] == cur) continue;
         anyID* cl = NULL;
         if (ts3Functions.getChannelClientList(sch, channels[i], &cl) == ERROR_ok && cl) {
             if (cl[0] == 0) found = true;
@@ -250,23 +325,18 @@ static void createTempChannel(uint64 sch) {
     ts3Functions.setChannelVariableAsString(sch, 0, CHANNEL_NAME, name);
     ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_FLAG_PERMANENT, 0);
     ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_FLAG_SEMI_PERMANENT, 0);
-    /* keep the empty temp channel alive long enough to move someone into it */
     ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_DELETE_DELAY, 60);
     ts3Functions.flushChannelCreation(sch, 0, NULL);   /* parent 0 = root */
 }
 
 static void doOneMove(Job* j) {
-    uint64 cur = 0;
-    ts3Functions.getChannelOfClient(j->sch, j->target, &cur);
-
     uint64* channels = NULL;
     if (ts3Functions.getChannelList(j->sch, &channels) != ERROR_ok || !channels) return;
 
-    std::vector<uint64> empties;
+    std::vector<uint64> empties;  /* consumed as we go so a group spreads out */
     std::vector<uint64> all;
     for (int i = 0; channels[i]; ++i) {
         uint64 ch = channels[i];
-        if (ch == cur) continue;             /* never "move" to where they already are */
         all.push_back(ch);
         anyID* cl = NULL;
         if (ts3Functions.getChannelClientList(j->sch, ch, &cl) == ERROR_ok && cl) {
@@ -276,19 +346,45 @@ static void doOneMove(Job* j) {
     }
     ts3Functions.freeMemory(channels);
 
-    uint64 dest = 0;
-    if (!empties.empty()) {
-        dest = empties[rand() % empties.size()];
-    } else if (j->allChannels && !all.empty()) {
-        dest = all[rand() % all.size()];
-    } else if (g.autoCreateTemp) {
-        createTempChannel(j->sch);           /* used automatically next cycle */
-        return;
-    } else {
-        return;                              /* skip this cycle */
-    }
+    bool createdThisTick = false;
+    for (size_t t = 0; t < j->targets.size(); ++t) {
+        anyID target = j->targets[t];
+        uint64 cur = 0;
+        ts3Functions.getChannelOfClient(j->sch, target, &cur);
 
-    ts3Functions.requestClientMove(j->sch, j->target, dest, "", NULL);
+        uint64 dest = 0;
+        int pick = -1;
+        if (!empties.empty()) {
+            for (int tries = 0; tries < (int)empties.size(); ++tries) {
+                int idx = rand() % (int)empties.size();
+                if (empties[idx] != cur) { pick = idx; break; }
+            }
+        }
+        if (pick >= 0) {
+            dest = empties[pick];
+            empties.erase(empties.begin() + pick);      /* don't reuse for this tick */
+        } else if (j->allChannels) {
+            for (int tries = 0; tries < 8 && !all.empty(); ++tries) {
+                uint64 c = all[rand() % (int)all.size()];
+                if (c != cur) { dest = c; break; }
+            }
+        } else if (g.autoCreateTemp && !createdThisTick) {
+            createTempChannel(j->sch);                  /* used automatically next tick */
+            createdThisTick = true;
+            continue;
+        } else {
+            continue;                                   /* skip this target this cycle */
+        }
+
+        if (dest) ts3Functions.requestClientMove(j->sch, target, dest, "", NULL);
+    }
+}
+
+static void doOnePoke(Job* j) {
+    for (size_t i = 0; i < j->targets.size(); ++i) {
+        std::string m = pickPokeMessage();
+        ts3Functions.requestClientPoke(j->sch, j->targets[i], m.c_str(), NULL);
+    }
 }
 
 static DWORD WINAPI moveThread(LPVOID p) {
@@ -305,30 +401,6 @@ static DWORD WINAPI moveThread(LPVOID p) {
     return 0;
 }
 
-static std::string randomChars(int n) {
-    static const char cs[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    if (n < 1)   n = 1;
-    if (n > 100) n = 100;
-    std::string s;
-    s.reserve(n);
-    for (int i = 0; i < n; ++i) s += cs[rand() % (sizeof(cs) - 1)];
-    return s;
-}
-
-static void doOnePoke(Job* j) {
-    const char* msg = g.customMsg;
-    std::string pick;
-    if (g.pokeMode == PM_RANDOM && !g.randomMsgs.empty()) {
-        pick = g.randomMsgs[rand() % g.randomMsgs.size()];
-        msg = pick.c_str();
-    } else if (g.pokeMode == PM_RANDCHARS) {
-        pick = randomChars(g.randCharLen);
-        msg = pick.c_str();
-    }
-    ts3Functions.requestClientPoke(j->sch, j->target, msg, NULL);
-}
-
 static DWORD WINAPI pokeThread(LPVOID p) {
     Job* j = (Job*)p;
     srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)j);
@@ -342,6 +414,58 @@ static DWORD WINAPI pokeThread(LPVOID p) {
     InterlockedExchange(&j->active, 0);
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Start / stop actions                                               */
+/* ------------------------------------------------------------------ */
+
+static void startMove(uint64 sch, const std::vector<anyID>& targets) {
+    if (targets.empty()) return;
+
+    int allMode = (g.noEmptyMode == NE_ALL) ? 1 : 0;
+    if (g.noEmptyMode == NE_ASK && !hasAnyEmptyChannel(sch)) {
+        int r = MessageBoxA(GetForegroundWindow(),
+                            "No empty channels are available right now.\n\n"
+                            "Move among ALL channels anyway?",
+                            "Random Move", MB_YESNO | MB_ICONWARNING);
+        if (r == IDYES) allMode = 1;
+        else return;
+    }
+
+    EnterCriticalSection(&cs);
+    stopJob(moveJob);
+    moveJob.sch = sch;
+    moveJob.targets = targets;
+    moveJob.allChannels = allMode;
+    moveJob.intervalMs = g.moveIntervalMs;
+    moveJob.limiterMs = g.limiterSec * 1000;
+    launchJob(moveJob, moveThread);
+    LeaveCriticalSection(&cs);
+}
+
+static void startPoke(uint64 sch, const std::vector<anyID>& targets) {
+    if (targets.empty()) return;
+    EnterCriticalSection(&cs);
+    stopJob(pokeJob);
+    pokeJob.sch = sch;
+    pokeJob.targets = targets;
+    pokeJob.intervalMs = g.pokeDelayMs;
+    pokeJob.limiterMs = g.limiterSec * 1000;
+    launchJob(pokeJob, pokeThread);
+    LeaveCriticalSection(&cs);
+}
+
+static void stopMove() { EnterCriticalSection(&cs); stopJob(moveJob); LeaveCriticalSection(&cs); }
+static void stopPoke() { EnterCriticalSection(&cs); stopJob(pokeJob); LeaveCriticalSection(&cs); }
+
+static void hardStop() {
+    EnterCriticalSection(&cs);
+    stopJob(moveJob);
+    stopJob(pokeJob);
+    LeaveCriticalSection(&cs);
+}
+
+static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
 
 /* ------------------------------------------------------------------ */
 /* Settings dialog                                                    */
@@ -366,7 +490,7 @@ static void setDlgSec(HWND h, int id, int ms) {
     SetDlgItemTextA(h, id, buf);
 }
 
-/* read a decimal-seconds field and return milliseconds (floored at 100ms) */
+/* read a decimal-seconds field and return milliseconds (floored at 10ms) */
 static int getDlgMs(HWND h, int id, int fallbackMs) {
     char buf[32];
     buf[0] = '\0';
@@ -374,7 +498,7 @@ static int getDlgMs(HWND h, int id, int fallbackMs) {
     double s = atof(buf);
     if (s <= 0) return fallbackMs;
     int ms = (int)(s * 1000.0 + 0.5);
-    if (ms < 100) ms = 100;   /* don't hammer the server / trip flood protection */
+    if (ms < 10) ms = 10;   /* hard floor; see the flood-protection note in the README */
     return ms;
 }
 
@@ -392,8 +516,13 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
                          g.pokeMode == PM_RANDOM    ? IDC_PM_RANDOM :
                          g.pokeMode == PM_RANDCHARS ? IDC_PM_RANDCHARS : IDC_PM_CUSTOM);
         setDlgInt(hDlg, IDC_RANDLEN, g.randCharLen);
-        setDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
         SetDlgItemTextA(hDlg, IDC_CUSTOMMSG, g.customMsg);
+
+        CheckDlgButton(hDlg, IDC_AUTOPOKEBACK, g.autoPokeBack ? BST_CHECKED : BST_UNCHECKED);
+        setDlgInt(hDlg, IDC_APB_TIMES, g.autoPokeBackTimes);
+        setDlgInt(hDlg, IDC_TALK_TIMES, g.talkPokeTimes);
+
+        setDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
 
         /* join random messages with CRLF for the multiline edit */
         std::string joined;
@@ -419,9 +548,18 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
             g.randCharLen = getDlgInt(hDlg, IDC_RANDLEN, g.randCharLen);
             if (g.randCharLen < 1)   g.randCharLen = 1;
             if (g.randCharLen > 100) g.randCharLen = 100;
+            GetDlgItemTextA(hDlg, IDC_CUSTOMMSG, g.customMsg, sizeof(g.customMsg));
+
+            g.autoPokeBack = IsDlgButtonChecked(hDlg, IDC_AUTOPOKEBACK) ? 1 : 0;
+            g.autoPokeBackTimes = getDlgInt(hDlg, IDC_APB_TIMES, g.autoPokeBackTimes);
+            if (g.autoPokeBackTimes < 1)   g.autoPokeBackTimes = 1;
+            if (g.autoPokeBackTimes > 100) g.autoPokeBackTimes = 100;
+            g.talkPokeTimes = getDlgInt(hDlg, IDC_TALK_TIMES, g.talkPokeTimes);
+            if (g.talkPokeTimes < 1)   g.talkPokeTimes = 1;
+            if (g.talkPokeTimes > 100) g.talkPokeTimes = 100;
+
             g.limiterSec = getDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
             if (g.limiterSec < 0) g.limiterSec = 0;
-            GetDlgItemTextA(hDlg, IDC_CUSTOMMSG, g.customMsg, sizeof(g.customMsg));
 
             /* split the multiline edit back into a list */
             char buf[4096];
@@ -457,62 +595,6 @@ static void openSettings() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Menu action handlers                                               */
-/* ------------------------------------------------------------------ */
-
-static void onMoveStart(uint64 sch, anyID target) {
-    /* decide the "no empty channel" behaviour up front, on the UI thread */
-    int allMode = (g.noEmptyMode == NE_ALL) ? 1 : 0;
-    if (g.noEmptyMode == NE_ASK && !hasEmptyChannel(sch, target)) {
-        int r = MessageBoxA(GetForegroundWindow(),
-                            "No empty channels are available right now.\n\n"
-                            "Move the user among ALL channels anyway?",
-                            "Random Move", MB_YESNO | MB_ICONWARNING);
-        if (r == IDYES) allMode = 1;
-        else return;   /* cancel start */
-    }
-
-    EnterCriticalSection(&cs);
-    moveJob.sch = sch;
-    moveJob.target = target;
-    moveJob.allChannels = allMode;
-    moveJob.intervalMs = g.moveIntervalMs;
-    moveJob.limiterMs = g.limiterSec * 1000;
-    startJob(moveJob, moveThread);
-    LeaveCriticalSection(&cs);
-}
-
-static void onPokeStart(uint64 sch, anyID target) {
-    EnterCriticalSection(&cs);
-    pokeJob.sch = sch;
-    pokeJob.target = target;
-    pokeJob.intervalMs = g.pokeDelayMs;
-    pokeJob.limiterMs = g.limiterSec * 1000;
-    startJob(pokeJob, pokeThread);
-    LeaveCriticalSection(&cs);
-}
-
-/* Chaos = move AND poke the same target at once. */
-static void onChaosStart(uint64 sch, anyID target) {
-    onMoveStart(sch, target);   /* may prompt if no empty channel + Ask mode */
-    onPokeStart(sch, target);
-}
-
-static void onChaosStop() {
-    EnterCriticalSection(&cs);
-    stopJob(moveJob);
-    stopJob(pokeJob);
-    LeaveCriticalSection(&cs);
-}
-
-static void hardStop() {
-    EnterCriticalSection(&cs);
-    stopJob(moveJob);
-    stopJob(pokeJob);
-    LeaveCriticalSection(&cs);
-}
-
-/* ------------------------------------------------------------------ */
 /* Menu creation helper                                               */
 /* ------------------------------------------------------------------ */
 
@@ -542,14 +624,18 @@ void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) {
 
 int ts3plugin_init() {
     InitializeCriticalSection(&cs);
-    memset(&moveJob, 0, sizeof(moveJob));
-    memset(&pokeJob, 0, sizeof(pokeJob));
+    srand((unsigned)time(NULL));
     loadSettings();
     return 0;   /* success */
 }
 
 void ts3plugin_shutdown() {
     hardStop();
+    EnterCriticalSection(&cs);
+    talkTargets.clear();
+    pokeBackCooldown.clear();
+    talkCooldown.clear();
+    LeaveCriticalSection(&cs);
     DeleteCriticalSection(&cs);
     if (pluginID) {
         free(pluginID);
@@ -577,18 +663,25 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    /* number of items + 1 for the terminating NULL */
-    const int count = 8;
+    const int count = 13;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_MOVE_START,  "Random Move: Start");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_MOVE_STOP,   "Random Move: Stop");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_POKE_START,  "Poke: Start");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_POKE_STOP,   "Poke: Stop");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_CHAOS_START, "Chaos (move + poke): Start");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_CHAOS_STOP,  "Chaos (move + poke): Stop");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_SETTINGS,    "Settings...");
-    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_HARDSTOP,    "HARD STOP - stop everything");
+    /* Right-click a USER */
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_MOVE_START,     "Random Move: Start");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_MOVE_STOP,      "Random Move: Stop");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_POKE_START,     "Poke: Start");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_POKE_STOP,      "Poke: Stop");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_CHAOS_START,    "Chaos (move + poke): Start");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_CHAOS_STOP,     "Chaos (move + poke): Stop");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_START, "Talk-poke: Arm");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_STOP,  "Talk-poke: Disarm");
+    /* Right-click a CHANNEL -> everyone in it */
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_MOVE_START_CH,  "Random Move everyone here");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke everyone here");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_CHAOS_START_CH, "Chaos everyone here");
+    /* Global plugin menu */
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SETTINGS,       "Settings...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_HARDSTOP,       "HARD STOP - stop everything");
     (*menuItems)[n++] = NULL;
 
     *menuIcon = NULL;
@@ -596,31 +689,67 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
 
 void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenuType type,
                                int menuItemID, uint64 selectedItemID) {
-    anyID target = (anyID)selectedItemID;   /* for CLIENT menus this is the client id */
+    anyID  clientTarget  = (anyID)selectedItemID;   /* CLIENT menus  */
+    uint64 channelTarget = selectedItemID;          /* CHANNEL menus */
 
     switch (menuItemID) {
+    /* ---- single user ---- */
     case MENU_MOVE_START:
-        if (type == PLUGIN_MENU_TYPE_CLIENT) onMoveStart(serverConnectionHandlerID, target);
+        if (type == PLUGIN_MENU_TYPE_CLIENT) startMove(serverConnectionHandlerID, one(clientTarget));
         break;
     case MENU_MOVE_STOP:
-        EnterCriticalSection(&cs);
-        stopJob(moveJob);
-        LeaveCriticalSection(&cs);
+        stopMove();
         break;
     case MENU_POKE_START:
-        if (type == PLUGIN_MENU_TYPE_CLIENT) onPokeStart(serverConnectionHandlerID, target);
+        if (type == PLUGIN_MENU_TYPE_CLIENT) startPoke(serverConnectionHandlerID, one(clientTarget));
         break;
     case MENU_POKE_STOP:
-        EnterCriticalSection(&cs);
-        stopJob(pokeJob);
-        LeaveCriticalSection(&cs);
+        stopPoke();
         break;
     case MENU_CHAOS_START:
-        if (type == PLUGIN_MENU_TYPE_CLIENT) onChaosStart(serverConnectionHandlerID, target);
+        if (type == PLUGIN_MENU_TYPE_CLIENT) {
+            startMove(serverConnectionHandlerID, one(clientTarget));
+            startPoke(serverConnectionHandlerID, one(clientTarget));
+        }
         break;
     case MENU_CHAOS_STOP:
-        onChaosStop();
+        hardStop();
         break;
+    case MENU_TALKPOKE_START:
+        if (type == PLUGIN_MENU_TYPE_CLIENT) {
+            EnterCriticalSection(&cs);
+            talkTargets.insert(clientTarget);
+            LeaveCriticalSection(&cs);
+            ts3Functions.printMessageToCurrentTab("[Fun Plugin] Talk-poke armed for the selected user.");
+        }
+        break;
+    case MENU_TALKPOKE_STOP:
+        if (type == PLUGIN_MENU_TYPE_CLIENT) {
+            EnterCriticalSection(&cs);
+            talkTargets.erase(clientTarget);
+            LeaveCriticalSection(&cs);
+            ts3Functions.printMessageToCurrentTab("[Fun Plugin] Talk-poke disarmed for the selected user.");
+        }
+        break;
+
+    /* ---- whole channel (group) ---- */
+    case MENU_MOVE_START_CH:
+        if (type == PLUGIN_MENU_TYPE_CHANNEL)
+            startMove(serverConnectionHandlerID, clientsInChannel(serverConnectionHandlerID, channelTarget));
+        break;
+    case MENU_POKE_START_CH:
+        if (type == PLUGIN_MENU_TYPE_CHANNEL)
+            startPoke(serverConnectionHandlerID, clientsInChannel(serverConnectionHandlerID, channelTarget));
+        break;
+    case MENU_CHAOS_START_CH:
+        if (type == PLUGIN_MENU_TYPE_CHANNEL) {
+            std::vector<anyID> v = clientsInChannel(serverConnectionHandlerID, channelTarget);
+            startMove(serverConnectionHandlerID, v);
+            startPoke(serverConnectionHandlerID, v);
+        }
+        break;
+
+    /* ---- global ---- */
     case MENU_SETTINGS:
         openSettings();
         break;
@@ -628,6 +757,51 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         hardStop();
         break;
     }
+}
+
+/* ---- Reactions: automatic poke-back and talk-poke ---- */
+
+int ts3plugin_onClientPokeEvent(uint64 serverConnectionHandlerID, anyID fromClientID,
+                                const char* pokerName, const char* pokerUniqueIdentity,
+                                const char* message, int ffIgnored) {
+    (void)pokerName; (void)pokerUniqueIdentity; (void)message; (void)ffIgnored;
+
+    if (g.autoPokeBack) {
+        DWORD now = GetTickCount();
+        bool ok;
+        int times;
+        EnterCriticalSection(&cs);
+        DWORD last = pokeBackCooldown[fromClientID];
+        ok = (last == 0) || ((now - last) > 5000);   /* 5s cooldown breaks ping-pong loops */
+        if (ok) pokeBackCooldown[fromClientID] = now;
+        times = g.autoPokeBackTimes;
+        LeaveCriticalSection(&cs);
+
+        if (ok) pokeTimes(serverConnectionHandlerID, fromClientID, times);
+    }
+    return 0;   /* 0 = let the incoming poke display normally */
+}
+
+void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int status,
+                                       int isReceivedWhisper, anyID clientID) {
+    (void)isReceivedWhisper;
+    if (status != STATUS_TALKING) return;
+
+    bool ok = false;
+    int times = 0;
+    EnterCriticalSection(&cs);
+    if (talkTargets.count(clientID)) {
+        DWORD now = GetTickCount();
+        DWORD last = talkCooldown[clientID];
+        if ((last == 0) || ((now - last) > 1000)) {   /* at most one burst/sec per user */
+            ok = true;
+            talkCooldown[clientID] = now;
+            times = g.talkPokeTimes;
+        }
+    }
+    LeaveCriticalSection(&cs);
+
+    if (ok) pokeTimes(serverConnectionHandlerID, clientID, times);
 }
 
 /* ------------------------------------------------------------------ */

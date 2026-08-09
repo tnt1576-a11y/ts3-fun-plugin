@@ -51,12 +51,23 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 
 ## Use
 
-1. Right-click a user in the channel tree → you'll see:
-   - **Random Move: Start / Stop**
-   - **Poke: Start / Stop**
-2. The global plugin menu has **Settings...** and **HARD STOP - stop everything**.
-3. Open **Settings...** to set the move interval, poke delay, custom/random messages,
-   and how the mover behaves when no channel is empty.
+**Right-click a USER:**
+- **Random Move: Start / Stop**
+- **Poke: Start / Stop**
+- **Chaos (move + poke): Start / Stop** — both at once
+- **Talk-poke: Arm / Disarm** — pokes them every time they start talking
+
+**Right-click a CHANNEL** (group actions on everyone in it):
+- **Random Move / Poke / Chaos everyone here**
+
+**Global plugin menu:** **Settings...** and **HARD STOP - stop everything**.
+(Any Stop item, or HARD STOP, halts the shared move/poke jobs regardless of how they were started.)
+
+Open **Settings...** for the move/poke intervals, message mode, and:
+- **Auto-poke-back** — when someone pokes you, poke them back N times (5s per-person
+  cooldown so two auto-pokers don't ping-pong forever).
+- **Talk-poke pokes per talk** — how many pokes each talk trigger sends.
+- **Auto-stop limiter** — run for N seconds then stop by itself (0 = no limit).
 
 ### "No empty channel" behaviour
 - **Ask me each time** — if nothing is empty when you start a move, you get a Yes/No
@@ -65,6 +76,13 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 - **Skip until one frees up** — only ever move into truly empty channels.
 - **Auto-create temporary empty channels** — if on, the plugin spawns throwaway empty
   channels to move the victim into (they self-delete when empty).
+
+### Very fast timing (below 0.1s)
+The interval fields accept decimals down to `0.01` (10 ms). **But** the server's
+anti-flood protection will start blocking commands — and can briefly kick you — if you
+fire moves/pokes too fast. To actually use ultra-fast speeds, grant your group the
+`b_client_ignore_antiflood` permission on your server (you're the owner). Otherwise keep
+intervals around `0.3s`+ to stay safe.
 
 ## Notes
 - You are the server owner, so channel-move / channel-create permissions are assumed.
