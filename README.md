@@ -61,7 +61,10 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 - **Random Move / Poke / Chaos everyone here**
 
 **Global plugin menu:** **Settings...** and **HARD STOP - stop everything**.
-(Any Stop item, or HARD STOP, halts the shared move/poke jobs regardless of how they were started.)
+HARD STOP is the failsafe — it stops **all** activity: the move/poke/chaos jobs (however
+they were started), **disarms every talk-poke** target, and **turns off auto-poke-back**
+for the session (re-enable it in Settings). The individual *Stop* items only stop their
+own job and leave the reactive features alone.
 
 Open **Settings...** for the move/poke intervals, message mode, and:
 - **Auto-poke-back** — when someone pokes you, poke them back N times (5s per-person

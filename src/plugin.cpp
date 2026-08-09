@@ -458,11 +458,25 @@ static void startPoke(uint64 sch, const std::vector<anyID>& targets) {
 static void stopMove() { EnterCriticalSection(&cs); stopJob(moveJob); LeaveCriticalSection(&cs); }
 static void stopPoke() { EnterCriticalSection(&cs); stopJob(pokeJob); LeaveCriticalSection(&cs); }
 
-static void hardStop() {
+/* Stop the timed jobs only (used by Chaos: Stop and by shutdown). */
+static void stopAllJobs() {
     EnterCriticalSection(&cs);
     stopJob(moveJob);
     stopJob(pokeJob);
     LeaveCriticalSection(&cs);
+}
+
+/* Failsafe: stop EVERYTHING - timed jobs AND the reactive features.
+ * Auto-poke-back is turned off for the session (re-enable it in Settings);
+ * all talk-poke arming is cleared. */
+static void hardStop() {
+    stopAllJobs();
+    EnterCriticalSection(&cs);
+    talkTargets.clear();      /* disarm every talk-poke target */
+    g.autoPokeBack = 0;       /* stop reacting to incoming pokes */
+    LeaveCriticalSection(&cs);
+    ts3Functions.printMessageToCurrentTab(
+        "[Fun Plugin] HARD STOP: all jobs stopped, talk-poke disarmed, auto-poke-back turned off.");
 }
 
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
@@ -630,7 +644,7 @@ int ts3plugin_init() {
 }
 
 void ts3plugin_shutdown() {
-    hardStop();
+    stopAllJobs();
     EnterCriticalSection(&cs);
     talkTargets.clear();
     pokeBackCooldown.clear();
@@ -713,7 +727,7 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         }
         break;
     case MENU_CHAOS_STOP:
-        hardStop();
+        stopAllJobs();
         break;
     case MENU_TALKPOKE_START:
         if (type == PLUGIN_MENU_TYPE_CLIENT) {
