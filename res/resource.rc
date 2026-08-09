@@ -1,0 +1,49 @@
+#include <windows.h>
+#include "resource.h"
+
+/* Native settings dialog. Units are dialog units. */
+IDD_SETTINGS DIALOGEX 0, 0, 300, 322
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Fun Plugin - Settings"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    /* ---- Random Move group ---- */
+    GROUPBOX        "Random Move", IDC_LBL_MOVE, 7, 5, 286, 100
+
+    LTEXT           "Seconds between moves (e.g. 0.3 = fast):", -1, 16, 22, 150, 10
+    EDITTEXT        IDC_MOVE_INTERVAL, 170, 20, 45, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "When no channel is empty:", -1, 16, 40, 120, 10
+    AUTORADIOBUTTON "Ask me each time",          IDC_NE_ASK,  20, 52, 130, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Use ALL channels",          IDC_NE_ALL,  20, 63, 130, 10
+    AUTORADIOBUTTON "Skip until one frees up",   IDC_NE_SKIP, 20, 74, 130, 10
+    AUTOCHECKBOX    "Auto-create temporary empty channels", IDC_AUTOCREATE, 20, 88, 200, 10, WS_GROUP
+
+    /* ---- Poke group ---- */
+    GROUPBOX        "Poke", IDC_LBL_POKE, 7, 110, 286, 152
+
+    LTEXT           "Seconds between pokes (e.g. 0.3 = fast):", -1, 16, 127, 150, 10
+    EDITTEXT        IDC_POKE_DELAY, 170, 125, 45, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Message:", -1, 16, 144, 60, 10
+    AUTORADIOBUTTON "Custom message",           IDC_PM_CUSTOM,    20, 156, 120, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Random message from list",  IDC_PM_RANDOM,    20, 167, 120, 10
+    AUTORADIOBUTTON "Random letters/numbers, length:", IDC_PM_RANDCHARS, 20, 178, 145, 10
+    EDITTEXT        IDC_RANDLEN, 168, 177, 30, 12, ES_NUMBER | WS_TABSTOP
+
+    LTEXT           "Custom message:", -1, 16, 194, 100, 10, WS_GROUP
+    EDITTEXT        IDC_CUSTOMMSG, 16, 205, 270, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Random messages (one per line):", -1, 16, 222, 150, 10
+    EDITTEXT        IDC_RANDOMMSGS, 16, 233, 270, 24,
+                    ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+
+    /* ---- Limiter (applies to Move, Poke and Chaos) ---- */
+    GROUPBOX        "Limiter", IDC_LBL_GLOBAL, 7, 267, 286, 30
+    LTEXT           "Auto-stop after (seconds, 0 = no limit):", -1, 16, 281, 150, 10
+    EDITTEXT        IDC_LIMITER, 200, 279, 45, 12, ES_NUMBER | WS_TABSTOP
+
+    /* ---- Buttons ---- */
+    DEFPUSHBUTTON   "OK",     IDOK,     182, 302, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 240, 302, 50, 14
+END

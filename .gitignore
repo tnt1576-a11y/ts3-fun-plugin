@@ -1,0 +1,10 @@
+# Build toolchain (large; set up separately per README)
+tools/
+
+# Build intermediates and the loose binary
+*.o
+/funplugin_win64.dll
+
+# The packaged installer in dist/ IS committed on purpose:
+!dist/
+!dist/*.ts3_plugin
