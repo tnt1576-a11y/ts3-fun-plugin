@@ -27,6 +27,7 @@
 #define IDC_AUTOPOKEBACK    1030  /* checkbox: poke back when poked          */
 #define IDC_APB_TIMES       1031  /* edit: pokes per auto-poke-back          */
 #define IDC_TALK_TIMES      1032  /* edit: pokes per talk trigger            */
+#define IDC_TALK_MSG        1033  /* edit: dedicated talk-poke message       */
 
 /* Static labels (no logic, just layout) */
 #define IDC_LBL_MOVE        1100

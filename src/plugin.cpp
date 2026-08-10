@@ -46,7 +46,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.3"
+#define PLUGIN_VERSION "1.4"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -90,6 +90,7 @@ struct Settings {
     int  autoPokeBackTimes;/* pokes per auto-poke-back   */
     int  talkPokeTimes;    /* pokes each time a watched user starts talking */
     char customMsg[256];
+    char talkPokeMsg[256]; /* dedicated talk-poke text; blank = use poke settings */
     std::vector<std::string> randomMsgs;
 };
 
@@ -115,6 +116,7 @@ static void setDefaults() {
     g.autoPokeBackTimes= 3;
     g.talkPokeTimes    = 1;
     strcpy(g.customMsg, "stop ignoring me!");
+    g.talkPokeMsg[0]   = '\0';   /* blank = fall back to poke settings */
     g.randomMsgs.clear();
     g.randomMsgs.push_back("boo!");
     g.randomMsgs.push_back("wake up");
@@ -148,6 +150,7 @@ static void loadSettings() {
     g.autoPokeBackTimes= GetPrivateProfileIntA("react", "autoPokeBackTimes", g.autoPokeBackTimes, ini);
     g.talkPokeTimes    = GetPrivateProfileIntA("react", "talkPokeTimes", g.talkPokeTimes, ini);
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
+    GetPrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, g.talkPokeMsg, sizeof(g.talkPokeMsg), ini);
 
     int count = GetPrivateProfileIntA("poke", "randomCount", -1, ini);
     if (count >= 0) {
@@ -190,6 +193,7 @@ static void saveSettings() {
     WritePrivateProfileStringA("react", "autoPokeBackTimes", num, ini);
     _snprintf(num, sizeof(num), "%d", g.talkPokeTimes);
     WritePrivateProfileStringA("react", "talkPokeTimes", num, ini);
+    WritePrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, ini);
 
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
     WritePrivateProfileStringA("poke", "randomCount", num, ini);
@@ -228,6 +232,12 @@ static void pokeTimes(uint64 sch, anyID target, int times) {
         std::string m = pickPokeMessage();
         ts3Functions.requestClientPoke(sch, target, m.c_str(), NULL);
     }
+}
+
+/* poke a fixed message N times (used by talk-poke's dedicated text) */
+static void pokeTimesMsg(uint64 sch, anyID target, int times, const char* msg) {
+    for (int i = 0; i < times; ++i)
+        ts3Functions.requestClientPoke(sch, target, msg, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -540,6 +550,7 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
         CheckDlgButton(hDlg, IDC_AUTOPOKEBACK, g.autoPokeBack ? BST_CHECKED : BST_UNCHECKED);
         setDlgInt(hDlg, IDC_APB_TIMES, g.autoPokeBackTimes);
         setDlgInt(hDlg, IDC_TALK_TIMES, g.talkPokeTimes);
+        SetDlgItemTextA(hDlg, IDC_TALK_MSG, g.talkPokeMsg);
 
         setDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
 
@@ -576,6 +587,7 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
             g.talkPokeTimes = getDlgInt(hDlg, IDC_TALK_TIMES, g.talkPokeTimes);
             if (g.talkPokeTimes < 1)   g.talkPokeTimes = 1;
             if (g.talkPokeTimes > 100) g.talkPokeTimes = 100;
+            GetDlgItemTextA(hDlg, IDC_TALK_MSG, g.talkPokeMsg, sizeof(g.talkPokeMsg));
 
             g.limiterSec = getDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
             if (g.limiterSec < 0) g.limiterSec = 0;
@@ -851,7 +863,12 @@ void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int sta
     }
     LeaveCriticalSection(&cs);
 
-    if (doPoke) pokeTimes(serverConnectionHandlerID, clientID, times);
+    if (doPoke) {
+        if (g.talkPokeMsg[0])
+            pokeTimesMsg(serverConnectionHandlerID, clientID, times, g.talkPokeMsg);
+        else
+            pokeTimes(serverConnectionHandlerID, clientID, times);
+    }
     if (doMove) {
         Job tmp{};                     /* transient single-target job, reuses doOneMove */
         tmp.sch = serverConnectionHandlerID;
