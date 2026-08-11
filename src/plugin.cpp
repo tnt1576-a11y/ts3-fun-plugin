@@ -47,7 +47,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.1"
+#define PLUGIN_VERSION "2.2"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -84,7 +84,9 @@ enum { PM_CUSTOM = 0, PM_RANDOM = 1, PM_RANDCHARS = 2 };
 struct Settings {
     int  moveIntervalMs;   /* time between moves (ms), supports sub-second */
     int  noEmptyMode;      /* NE_ASK / NE_ALL / NE_SKIP  */
-    int  autoCreateTemp;   /* 0/1                        */
+    int  autoCreateTemp;   /* 0/1: use a self-made pool of channels instead of existing ones */
+    int  tempChannelCount; /* how many pool channels to create */
+    char tempChannelName[64];/* base name; channels are <name>1..<name>N */
     int  pokeDelayMs;      /* time between pokes (ms)    */
     int  pokeMode;         /* PM_CUSTOM / PM_RANDOM / PM_RANDCHARS */
     int  randCharLen;      /* length for PM_RANDCHARS    */
@@ -108,6 +110,11 @@ static std::set<anyID>          talkMoveTargets;  /* users armed for talk-move  
 static std::map<anyID, DWORD>   pokeBackCooldown; /* last auto-poke-back tick    */
 static std::map<anyID, DWORD>   talkCooldown;     /* last talk-poke tick         */
 static std::map<anyID, DWORD>   talkMoveCooldown; /* last talk-move tick         */
+static std::set<uint64>         g_tempChannels;   /* pool channels WE created (safe to delete) */
+static char          g_poolBase[64] = {};    /* base name of the current pool (guarded by cs) */
+static int           g_poolExpected = 0;      /* how many pool channels we expect              */
+static DWORD         g_poolDeadline = 0;       /* only track new channels until this tick        */
+static volatile LONG g_poolCreating = 0;       /* 1 while we're spawning the pool                */
 
 /* Self-lock: pin my own client into a channel (guarded by cs) */
 static volatile LONG selfLock = 0;
@@ -136,6 +143,8 @@ static void setDefaults() {
     g.moveIntervalMs   = 5000;
     g.noEmptyMode      = NE_ASK;
     g.autoCreateTemp   = 0;
+    g.tempChannelCount = 4;
+    strcpy(g.tempChannelName, "funbox");
     g.pokeDelayMs      = 3000;
     g.pokeMode         = PM_CUSTOM;
     g.randCharLen      = 8;
@@ -172,6 +181,8 @@ static void loadSettings() {
     g.moveIntervalMs   = GetPrivateProfileIntA("move", "intervalMs", g.moveIntervalMs, ini);
     g.noEmptyMode      = GetPrivateProfileIntA("move", "noEmptyMode", g.noEmptyMode, ini);
     g.autoCreateTemp   = GetPrivateProfileIntA("move", "autoCreate",  g.autoCreateTemp, ini);
+    g.tempChannelCount = GetPrivateProfileIntA("move", "tempCount",   g.tempChannelCount, ini);
+    GetPrivateProfileStringA("move", "tempName", g.tempChannelName, g.tempChannelName, sizeof(g.tempChannelName), ini);
     g.pokeDelayMs      = GetPrivateProfileIntA("poke", "delayMs",    g.pokeDelayMs, ini);
     g.pokeMode         = GetPrivateProfileIntA("poke", "mode",        g.pokeMode, ini);
     g.randCharLen      = GetPrivateProfileIntA("poke", "randLen",    g.randCharLen, ini);
@@ -207,6 +218,9 @@ static void saveSettings() {
     WritePrivateProfileStringA("move", "noEmptyMode", num, ini);
     _snprintf(num, sizeof(num), "%d", g.autoCreateTemp);
     WritePrivateProfileStringA("move", "autoCreate", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.tempChannelCount);
+    WritePrivateProfileStringA("move", "tempCount", num, ini);
+    WritePrivateProfileStringA("move", "tempName", g.tempChannelName, ini);
 
     _snprintf(num, sizeof(num), "%d", g.pokeDelayMs);
     WritePrivateProfileStringA("poke", "delayMs", num, ini);
@@ -366,21 +380,119 @@ static bool hasAnyEmptyChannel(uint64 sch) {
     return found;
 }
 
-/* Best-effort: ask the server to create a temporary empty channel at root.
- * We do not need its id - the next move cycle will simply find it empty. */
-static void createTempChannel(uint64 sch) {
-    static int counter = 0;
-    char name[64];
-    _snprintf(name, sizeof(name), "funbox-%d-%u", ++counter, (unsigned)(GetTickCount() & 0xffff));
+/* true if `name` is exactly "<base><digits>" (e.g. base "test" -> "test1", "test42").
+ * This is the guard that stops us ever deleting a real channel. */
+static bool isPoolName(const char* name, const char* base) {
+    if (!name || !base || !base[0]) return false;
+    size_t bl = strlen(base);
+    if (strncmp(name, base, bl) != 0) return false;
+    const char* rest = name + bl;
+    if (*rest == '\0') return false;
+    for (; *rest; ++rest) if (*rest < '0' || *rest > '9') return false;
+    return true;
+}
 
-    ts3Functions.setChannelVariableAsString(sch, 0, CHANNEL_NAME, name);
-    ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_FLAG_PERMANENT, 0);
-    ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_FLAG_SEMI_PERMANENT, 0);
-    ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_DELETE_DELAY, 60);
-    ts3Functions.flushChannelCreation(sch, 0, NULL);   /* parent 0 = root */
+/* the root-level channel that currently sorts LAST (nothing is ordered below it) */
+static uint64 lastRootChannel(uint64 sch) {
+    uint64* channels = NULL;
+    if (ts3Functions.getChannelList(sch, &channels) != ERROR_ok || !channels) return 0;
+    std::vector<uint64> roots;
+    std::set<uint64> hasSuccessor;   /* every CHANNEL_ORDER value = a channel with something below it */
+    for (int i = 0; channels[i]; ++i) {
+        uint64 ch = channels[i], parent = 0;
+        ts3Functions.getParentChannelOfChannel(sch, ch, &parent);
+        if (parent != 0) continue;   /* root level only */
+        roots.push_back(ch);
+        uint64 order = 0;
+        ts3Functions.getChannelVariableAsUInt64(sch, ch, CHANNEL_ORDER, &order);
+        hasSuccessor.insert(order);
+    }
+    ts3Functions.freeMemory(channels);
+    for (size_t i = 0; i < roots.size(); ++i)
+        if (hasSuccessor.find(roots[i]) == hasSuccessor.end())
+            return roots[i];
+    return 0;
+}
+
+/* Create a pool of N temporary channels (<base>1..<base>N) at the end of the list.
+ * Their ids are captured in onNewChannelCreatedEvent (only ones WE make, matching
+ * the name pattern, during this creation window). */
+static void createTempPool(uint64 sch) {
+    int count = g.tempChannelCount;
+    if (count < 1)  count = 1;
+    if (count > 50) count = 50;
+
+    EnterCriticalSection(&cs);
+    g_tempChannels.clear();
+    strncpy(g_poolBase, g.tempChannelName, sizeof(g_poolBase) - 1);
+    g_poolBase[sizeof(g_poolBase) - 1] = '\0';
+    if (g_poolBase[0] == '\0') strcpy(g_poolBase, "funbox");
+    g_poolExpected = count;
+    g_poolDeadline = GetTickCount() + 15000;
+    LeaveCriticalSection(&cs);
+    InterlockedExchange(&g_poolCreating, 1);
+
+    uint64 lastRoot = lastRootChannel(sch);
+
+    for (int i = 1; i <= count; ++i) {
+        char name[80];
+        _snprintf(name, sizeof(name), "%s%d", g_poolBase, i);
+        ts3Functions.setChannelVariableAsString(sch, 0, CHANNEL_NAME, name);
+        ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_FLAG_PERMANENT, 0);
+        ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_FLAG_SEMI_PERMANENT, 0);
+        ts3Functions.setChannelVariableAsInt(sch, 0, CHANNEL_DELETE_DELAY, 60);
+        if (lastRoot) ts3Functions.setChannelVariableAsUInt64(sch, 0, CHANNEL_ORDER, lastRoot);
+        ts3Functions.flushChannelCreation(sch, 0, NULL);   /* parent 0 = root */
+    }
+}
+
+/* Delete ONLY the channels we created. Re-checks each name against the pool
+ * pattern right before deleting, so a real channel can never be removed. */
+static void deleteTempChannels(uint64 sch) {
+    std::vector<uint64> ids;
+    char base[64];
+    EnterCriticalSection(&cs);
+    ids.assign(g_tempChannels.begin(), g_tempChannels.end());
+    g_tempChannels.clear();
+    strncpy(base, g_poolBase, sizeof(base) - 1);
+    base[sizeof(base) - 1] = '\0';
+    LeaveCriticalSection(&cs);
+    InterlockedExchange(&g_poolCreating, 0);
+
+    if (sch == 0) return;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        char* name = NULL;
+        bool ours = false;
+        if (ts3Functions.getChannelVariableAsString(sch, ids[i], CHANNEL_NAME, &name) == ERROR_ok && name) {
+            ours = isPoolName(name, base);      /* SAFETY re-check */
+            ts3Functions.freeMemory(name);
+        }
+        if (ours) ts3Functions.requestChannelDelete(sch, ids[i], 1, NULL);
+    }
 }
 
 static void doOneMove(Job* j) {
+    /* Pool mode: move only among the channels we created. */
+    if (g.autoCreateTemp) {
+        std::vector<uint64> pool;
+        EnterCriticalSection(&cs);
+        pool.assign(g_tempChannels.begin(), g_tempChannels.end());
+        LeaveCriticalSection(&cs);
+        if (pool.empty()) return;   /* pool still being created - wait */
+        for (size_t t = 0; t < j->targets.size(); ++t) {
+            anyID target = j->targets[t];
+            uint64 cur = 0;
+            ts3Functions.getChannelOfClient(j->sch, target, &cur);
+            uint64 dest = 0;
+            for (int tries = 0; tries < 8; ++tries) {
+                uint64 c = pool[rand() % pool.size()];
+                if (c != cur) { dest = c; break; }
+            }
+            if (dest) ts3Functions.requestClientMove(j->sch, target, dest, "", NULL);
+        }
+        return;
+    }
+
     uint64* channels = NULL;
     if (ts3Functions.getChannelList(j->sch, &channels) != ERROR_ok || !channels) return;
 
@@ -397,7 +509,6 @@ static void doOneMove(Job* j) {
     }
     ts3Functions.freeMemory(channels);
 
-    bool createdThisTick = false;
     for (size_t t = 0; t < j->targets.size(); ++t) {
         anyID target = j->targets[t];
         uint64 cur = 0;
@@ -419,10 +530,6 @@ static void doOneMove(Job* j) {
                 uint64 c = all[rand() % (int)all.size()];
                 if (c != cur) { dest = c; break; }
             }
-        } else if (g.autoCreateTemp && !createdThisTick) {
-            createTempChannel(j->sch);                  /* used automatically next tick */
-            createdThisTick = true;
-            continue;
         } else {
             continue;                                   /* skip this target this cycle */
         }
@@ -473,8 +580,9 @@ static DWORD WINAPI pokeThread(LPVOID p) {
 static void startMove(uint64 sch, const std::vector<anyID>& targets) {
     if (targets.empty()) return;
 
+    /* pool mode makes its own channels, so the "no empty channel" prompt doesn't apply */
     int allMode = (g.noEmptyMode == NE_ALL) ? 1 : 0;
-    if (g.noEmptyMode == NE_ASK && !hasAnyEmptyChannel(sch)) {
+    if (!g.autoCreateTemp && g.noEmptyMode == NE_ASK && !hasAnyEmptyChannel(sch)) {
         int r = MessageBoxA(GetForegroundWindow(),
                             "No empty channels are available right now.\n\n"
                             "Move among ALL channels anyway?",
@@ -492,6 +600,11 @@ static void startMove(uint64 sch, const std::vector<anyID>& targets) {
     moveJob.limiterMs = g.limiterSec * 1000;
     launchJob(moveJob, moveThread);
     LeaveCriticalSection(&cs);
+
+    if (g.autoCreateTemp) {
+        deleteTempChannels(sch);   /* clean up any leftover pool from a previous run */
+        createTempPool(sch);       /* fills asynchronously; the move loop waits for it */
+    }
 }
 
 static void startPoke(uint64 sch, const std::vector<anyID>& targets) {
@@ -506,15 +619,25 @@ static void startPoke(uint64 sch, const std::vector<anyID>& targets) {
     LeaveCriticalSection(&cs);
 }
 
-static void stopMove() { EnterCriticalSection(&cs); stopJob(moveJob); LeaveCriticalSection(&cs); }
+static void stopMove() {
+    uint64 sch;
+    EnterCriticalSection(&cs);
+    sch = moveJob.sch;
+    stopJob(moveJob);
+    LeaveCriticalSection(&cs);
+    deleteTempChannels(sch);   /* remove our pool channels (no-op if none) */
+}
 static void stopPoke() { EnterCriticalSection(&cs); stopJob(pokeJob); LeaveCriticalSection(&cs); }
 
 /* Stop the timed jobs only (used by Chaos: Stop and by shutdown). */
 static void stopAllJobs() {
+    uint64 sch;
     EnterCriticalSection(&cs);
+    sch = moveJob.sch;
     stopJob(moveJob);
     stopJob(pokeJob);
     LeaveCriticalSection(&cs);
+    deleteTempChannels(sch);   /* remove our pool channels (no-op if none) */
 }
 
 /* Failsafe: stop EVERYTHING - timed jobs AND the reactive features.
@@ -762,6 +885,8 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
                          g.noEmptyMode == NE_ALL ? IDC_NE_ALL :
                          g.noEmptyMode == NE_SKIP ? IDC_NE_SKIP : IDC_NE_ASK);
         CheckDlgButton(hDlg, IDC_AUTOCREATE, g.autoCreateTemp ? BST_CHECKED : BST_UNCHECKED);
+        setDlgInt(hDlg, IDC_TEMP_COUNT, g.tempChannelCount);
+        SetDlgItemTextA(hDlg, IDC_TEMP_NAME, g.tempChannelName);
 
         setDlgSec(hDlg, IDC_POKE_DELAY, g.pokeDelayMs);
         CheckRadioButton(hDlg, IDC_PM_CUSTOM, IDC_PM_RANDCHARS,
@@ -795,6 +920,11 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
             g.noEmptyMode = IsDlgButtonChecked(hDlg, IDC_NE_ALL) ? NE_ALL :
                             IsDlgButtonChecked(hDlg, IDC_NE_SKIP) ? NE_SKIP : NE_ASK;
             g.autoCreateTemp = IsDlgButtonChecked(hDlg, IDC_AUTOCREATE) ? 1 : 0;
+            g.tempChannelCount = getDlgInt(hDlg, IDC_TEMP_COUNT, g.tempChannelCount);
+            if (g.tempChannelCount < 1)  g.tempChannelCount = 1;
+            if (g.tempChannelCount > 50) g.tempChannelCount = 50;
+            GetDlgItemTextA(hDlg, IDC_TEMP_NAME, g.tempChannelName, sizeof(g.tempChannelName));
+            if (g.tempChannelName[0] == '\0') strcpy(g.tempChannelName, "funbox");
 
             g.pokeDelayMs = getDlgMs(hDlg, IDC_POKE_DELAY, g.pokeDelayMs);
             g.pokeMode = IsDlgButtonChecked(hDlg, IDC_PM_RANDOM)    ? PM_RANDOM :
@@ -1223,6 +1353,39 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     if (InterlockedIncrement(&g_rejoinAttempts) > 5)   /* don't loop on a ban / dead server */
         return;
     scheduleRejoin();
+}
+
+/* ---- Track the pool channels WE create so we can delete exactly those ---- */
+
+void ts3plugin_onNewChannelCreatedEvent(uint64 serverConnectionHandlerID, uint64 channelID,
+                                        uint64 channelParentID, anyID invokerID,
+                                        const char* invokerName, const char* invokerUniqueIdentifier) {
+    (void)channelParentID; (void)invokerName; (void)invokerUniqueIdentifier;
+    if (!g_poolCreating) return;
+    if (invokerID != ownClient(serverConnectionHandlerID)) return;   /* only channels I made */
+
+    char* name = NULL;
+    if (ts3Functions.getChannelVariableAsString(serverConnectionHandlerID, channelID,
+                                                CHANNEL_NAME, &name) == ERROR_ok && name) {
+        EnterCriticalSection(&cs);
+        if (g_poolCreating && isPoolName(name, g_poolBase) &&
+            (int)g_tempChannels.size() < g_poolExpected && GetTickCount() < g_poolDeadline) {
+            g_tempChannels.insert(channelID);
+            if ((int)g_tempChannels.size() >= g_poolExpected)
+                InterlockedExchange(&g_poolCreating, 0);
+        }
+        LeaveCriticalSection(&cs);
+        ts3Functions.freeMemory(name);
+    }
+}
+
+void ts3plugin_onDelChannelEvent(uint64 serverConnectionHandlerID, uint64 channelID,
+                                 anyID invokerID, const char* invokerName,
+                                 const char* invokerUniqueIdentifier) {
+    (void)serverConnectionHandlerID; (void)invokerID; (void)invokerName; (void)invokerUniqueIdentifier;
+    EnterCriticalSection(&cs);
+    g_tempChannels.erase(channelID);   /* stop tracking once it's gone (e.g. auto-deleted) */
+    LeaveCriticalSection(&cs);
 }
 
 /* ------------------------------------------------------------------ */

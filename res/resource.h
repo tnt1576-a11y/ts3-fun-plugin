@@ -10,6 +10,8 @@
 #define IDC_NE_ALL          1003  /* radio: use all channels              */
 #define IDC_NE_SKIP         1004  /* radio: skip until one frees up        */
 #define IDC_AUTOCREATE      1005  /* checkbox: auto-create temp channels   */
+#define IDC_TEMP_COUNT      1006  /* edit: how many pool channels          */
+#define IDC_TEMP_NAME       1007  /* edit: base name for pool channels     */
 
 /* Poke settings */
 #define IDC_POKE_DELAY      1010  /* edit: seconds between pokes           */
