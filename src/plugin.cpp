@@ -27,7 +27,6 @@
 
 #include "teamspeak/public_errors.h"
 #include "teamspeak/public_definitions.h"
-#include "teamlog/logtypes.h"
 #include "ts3_functions.h"
 #include "plugin.h"
 
@@ -48,7 +47,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.0"
+#define PLUGIN_VERSION "2.1"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -613,11 +612,6 @@ static void selfMovedHandler(uint64 sch, anyID clientID, uint64 newCh, bool forc
     }
 }
 
-/* write to the TeamSpeak client log (visible even while disconnected) */
-static void logDiag(const char* msg) {
-    ts3Functions.logMessage(msg, LogLevel_INFO, "FunPlugin", 0);
-}
-
 /* build a channel path like "Parent/Child/Leaf" (needed by guiConnect on rejoin) */
 static std::string channelPathOf(uint64 sch, uint64 ch) {
     std::vector<std::string> parts;
@@ -696,18 +690,12 @@ static DWORD WINAPI rejoinThread(LPVOID p) {
     LeaveCriticalSection(&cs);
 
     if (info.valid) {
-        char dbg[700];
-        _snprintf(dbg, sizeof(dbg), "rejoin: reconnecting to %s, channel '%s'",
-                  info.address, info.channelPath);
-        logDiag(dbg);
         uint64 newsch = 0;
         /* guiConnect takes the target channel directly, so the client joins the
          * right channel as part of connecting - no bookmark walk, no second thread. */
         ts3Functions.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, "", info.address, info.password,
                                 info.nickname, info.channelPath, "",
                                 "", "", "", "", "", "", "", &newsch);
-    } else {
-        logDiag("rejoin: no reconnect info captured; skipping");
     }
     InterlockedDecrement(&g_pending);
     return 0;
@@ -1187,32 +1175,14 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
                                            anyID kickerID, const char* kickerName,
                                            const char* kickerUniqueIdentifier, const char* kickMessage) {
     (void)oldChannelID; (void)newChannelID; (void)visibility;
-    (void)kickerName; (void)kickerUniqueIdentifier;
+    (void)kickerName; (void)kickerUniqueIdentifier; (void)kickMessage; (void)kickerID;
     anyID meNow = ownClient(serverConnectionHandlerID);
-    char dbg[224];
-    _snprintf(dbg, sizeof(dbg),
-              "KICKFROMSERVER fired: clientID=%u myId=%d ownNow=%u kicker=%u reason=%s",
-              (unsigned)clientID, (int)g_myId, (unsigned)meNow, (unsigned)kickerID,
-              kickMessage ? kickMessage : "");
-    logDiag(dbg);
     if (!selfLock) return;
     if (clientID == (anyID)g_myId || clientID == meNow) {
         /* channel is tracked continuously (connect + moves); don't recapture here
          * because the client is already tearing down and would clobber it. */
         InterlockedExchange(&g_kickFlag, 1);
-        logDiag("KICKFROMSERVER: that's me -> will rejoin after disconnect");
     }
-}
-
-/* Log server errors too, in case a kick surfaces here instead. */
-int ts3plugin_onServerErrorEvent(uint64 serverConnectionHandlerID, const char* errorMessage,
-                                 unsigned int error, const char* returnCode, const char* extraMessage) {
-    (void)serverConnectionHandlerID; (void)returnCode;
-    char dbg[256];
-    _snprintf(dbg, sizeof(dbg), "SERVERERROR: error=0x%04x msg=%s extra=%s",
-              error, errorMessage ? errorMessage : "", extraMessage ? extraMessage : "");
-    logDiag(dbg);
-    return 0;   /* let the client handle it normally */
 }
 
 /* Connection state changes drive the server-kick recovery. A voluntary
@@ -1241,23 +1211,17 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     bool kicked = (InterlockedExchange(&g_kickFlag, 0) == 1);
     if (!selfLock) return;
 
+    (void)errorNumber;
+    if (!kicked) return;   /* voluntary disconnect (or unknown) - leave it alone */
+
     bool infoValid;
     EnterCriticalSection(&cs);
     infoValid = g_reconn.valid;
     LeaveCriticalSection(&cs);
+    if (!infoValid) return;
 
-    char dbg[160];
-    _snprintf(dbg, sizeof(dbg), "disconnected: err=0x%04x kicked=%d infoValid=%d",
-              errorNumber, (int)kicked, (int)infoValid);
-    logDiag(dbg);
-
-    if (!kicked)    { logDiag("no kick signal - not reconnecting (voluntary disconnect?)"); return; }
-    if (!infoValid) { logDiag("kicked but no reconnect info - not reconnecting"); return; }
-
-    if (InterlockedIncrement(&g_rejoinAttempts) > 5) {
-        logDiag("gave up rejoining after 5 tries (banned or server down?)");
+    if (InterlockedIncrement(&g_rejoinAttempts) > 5)   /* don't loop on a ban / dead server */
         return;
-    }
     scheduleRejoin();
 }
 
