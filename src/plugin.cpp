@@ -23,9 +23,11 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <utility>
 
 #include "teamspeak/public_errors.h"
 #include "teamspeak/public_definitions.h"
+#include "teamlog/logtypes.h"
 #include "ts3_functions.h"
 #include "plugin.h"
 
@@ -46,7 +48,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.6"
+#define PLUGIN_VERSION "1.7"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -118,10 +120,12 @@ struct ReconnectInfo {
     char address[256];      /* "host:port"        */
     char password[256];     /* server password    */
     char nickname[128];
+    char serverName[128];   /* used to match the bookmark */
     char channelPath[512];  /* "Parent/Child/..." */
 };
 static ReconnectInfo g_reconn = {};
-static volatile LONG g_pendingRejoin = 0;   /* set by a real kick, consumed on disconnect */
+static volatile LONG g_rejoinAttempts = 0;   /* capped so a ban / dead server can't loop forever */
+static volatile LONG g_restoreChannel = 0;   /* after a rejoin, move back to the saved channel */
 
 /* Delayed-reaction plumbing (so talk reactions can wait a beat) */
 static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
@@ -569,6 +573,8 @@ static void scheduleReaction(const DelayedReaction& src) {
 /* Self-lock (anti-move for my own client)                            */
 /* ------------------------------------------------------------------ */
 
+static std::string channelPathOf(uint64 sch, uint64 ch);   /* defined below */
+
 /* forcedByOther == true  -> someone moved/kicked me: snap back to the lock channel
  * forcedByOther == false -> I moved myself: re-anchor the lock to where I went  */
 static void selfMovedHandler(uint64 sch, anyID clientID, uint64 newCh, bool forcedByOther) {
@@ -587,10 +593,22 @@ static void selfMovedHandler(uint64 sch, anyID clientID, uint64 newCh, bool forc
         if (newCh != lockCh)
             ts3Functions.requestClientMove(sch, clientID, lockCh, "", NULL);   /* snap back */
     } else {
+        std::string path = channelPathOf(sch, newCh);        /* keep saved channel current */
         EnterCriticalSection(&cs);
-        if (selfLock && sch == selfLockSch) selfLockChannel = newCh;            /* re-anchor */
+        if (selfLock && sch == selfLockSch) {
+            selfLockChannel = newCh;                          /* re-anchor */
+            if (g_reconn.valid) {
+                strncpy(g_reconn.channelPath, path.c_str(), sizeof(g_reconn.channelPath) - 1);
+                g_reconn.channelPath[sizeof(g_reconn.channelPath) - 1] = '\0';
+            }
+        }
         LeaveCriticalSection(&cs);
     }
+}
+
+/* write to the TeamSpeak client log (visible even while disconnected) */
+static void logDiag(const char* msg) {
+    ts3Functions.logMessage(msg, LogLevel_INFO, "FunPlugin", 0);
 }
 
 /* build a channel path like "Parent/Child/Leaf" (needed by guiConnect on rejoin) */
@@ -630,6 +648,13 @@ static void captureReconnectInfo(uint64 sch, uint64 channelOverride) {
         ts3Functions.freeMemory(n);
     }
 
+    std::string sname;
+    char* sv = NULL;
+    if (ts3Functions.getServerVariableAsString(sch, VIRTUALSERVER_NAME, &sv) == ERROR_ok && sv) {
+        sname = sv;
+        ts3Functions.freeMemory(sv);
+    }
+
     uint64 ch = channelOverride;
     if (ch == 0) ts3Functions.getChannelOfClient(sch, ownClient(sch), &ch);
     std::string path = channelPathOf(sch, ch);
@@ -642,9 +667,67 @@ static void captureReconnectInfo(uint64 sch, uint64 channelOverride) {
     g_reconn.password[sizeof(g_reconn.password) - 1] = '\0';
     strncpy(g_reconn.nickname, nick.c_str(), sizeof(g_reconn.nickname) - 1);
     g_reconn.nickname[sizeof(g_reconn.nickname) - 1] = '\0';
+    strncpy(g_reconn.serverName, sname.c_str(), sizeof(g_reconn.serverName) - 1);
+    g_reconn.serverName[sizeof(g_reconn.serverName) - 1] = '\0';
     strncpy(g_reconn.channelPath, path.c_str(), sizeof(g_reconn.channelPath) - 1);
     g_reconn.channelPath[sizeof(g_reconn.channelPath) - 1] = '\0';
     LeaveCriticalSection(&cs);
+}
+
+/* collect (name,uuid) of every server bookmark, descending into folders */
+static void collectBookmarks(struct PluginBookmarkList* list,
+                             std::vector<std::pair<std::string, std::string> >& out) {
+    if (!list) return;
+    for (int i = 0; i < list->itemcount; ++i) {
+        struct PluginBookmarkItem& it = list->items[i];
+        if (it.isFolder) {
+            collectBookmarks(it.folder, out);
+        } else if (it.name && it.uuid) {
+            out.push_back(std::make_pair(std::string(it.name), std::string(it.uuid)));
+        }
+    }
+}
+
+/* find the bookmark uuid to reconnect with: prefer a name matching the server,
+ * else the only bookmark if there's just one. Returns "" if none suitable. */
+static std::string findBookmarkUuid(const char* serverName) {
+    std::string uuid;
+    struct PluginBookmarkList* list = NULL;
+    if (ts3Functions.getBookmarkList(&list) != ERROR_ok || !list) return uuid;
+
+    std::vector<std::pair<std::string, std::string> > bms;
+    collectBookmarks(list, bms);
+    ts3Functions.freeMemory(list);
+
+    if (serverName && serverName[0]) {
+        for (size_t i = 0; i < bms.size(); ++i)
+            if (_stricmp(bms[i].first.c_str(), serverName) == 0) { uuid = bms[i].second; break; }
+    }
+    if (uuid.empty() && bms.size() == 1) uuid = bms[0].second;
+    return uuid;
+}
+
+/* resolve "Parent/Child/Leaf" to a channel id on the given connection */
+static uint64 resolveChannelPath(uint64 sch, const char* path) {
+    if (!path || !path[0]) return 0;
+    std::vector<std::string> parts;
+    std::string cur;
+    for (const char* p = path; ; ++p) {
+        if (*p == '/' || *p == '\0') {
+            if (!cur.empty()) parts.push_back(cur);
+            cur.clear();
+            if (*p == '\0') break;
+        } else {
+            cur += *p;
+        }
+    }
+    if (parts.empty()) return 0;
+    std::vector<char*> arr;
+    for (size_t i = 0; i < parts.size(); ++i) arr.push_back(const_cast<char*>(parts[i].c_str()));
+    arr.push_back(NULL);
+    uint64 id = 0;
+    ts3Functions.getChannelIDFromChannelNames(sch, &arr[0], &id);
+    return id;
 }
 
 static DWORD WINAPI rejoinThread(LPVOID p) {
@@ -661,9 +744,18 @@ static DWORD WINAPI rejoinThread(LPVOID p) {
 
     if (info.valid) {
         uint64 newsch = 0;
-        ts3Functions.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, "", info.address, info.password,
-                                info.nickname, info.channelPath, "",
-                                "", "", "", "", "", "", "", &newsch);
+        std::string uuid = findBookmarkUuid(info.serverName);
+        if (!uuid.empty()) {
+            logDiag("rejoin: connecting via bookmark (keeps your identity)");
+            ts3Functions.guiConnectBookmark(PLUGIN_CONNECT_TAB_CURRENT, uuid.c_str(), &newsch);
+        } else {
+            logDiag("rejoin: no matching bookmark; connecting via address");
+            ts3Functions.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, "", info.address, info.password,
+                                    info.nickname, info.channelPath, "",
+                                    "", "", "", "", "", "", "", &newsch);
+        }
+    } else {
+        logDiag("rejoin: no reconnect info captured; skipping");
     }
     InterlockedDecrement(&g_pending);
     return 0;
@@ -1133,27 +1225,30 @@ void ts3plugin_onClientKickFromChannelEvent(uint64 serverConnectionHandlerID, an
                      kickerID != ownClient(serverConnectionHandlerID));
 }
 
-/* Kicked from the SERVER: if it was me (by someone else), flag a rejoin. */
-void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, anyID clientID,
-                                           uint64 oldChannelID, uint64 newChannelID, int visibility,
-                                           anyID kickerID, const char* kickerName,
-                                           const char* kickerUniqueIdentifier, const char* kickMessage) {
-    (void)newChannelID; (void)visibility; (void)kickerName;
-    (void)kickerUniqueIdentifier; (void)kickMessage;
-    if (!selfLock || serverConnectionHandlerID != selfLockSch) return;
-    anyID me = ownClient(serverConnectionHandlerID);
-    if (clientID != me || kickerID == me) return;
-    /* still connected during this event: capture connect info + the channel we were in */
-    captureReconnectInfo(serverConnectionHandlerID, oldChannelID);
-    InterlockedExchange(&g_pendingRejoin, 1);
-}
-
-/* Connection state changes: keep self-lock anchored, and rejoin after a kick. */
+/* Connection state changes drive the server-kick recovery.
+ * A server kick shows up here as STATUS_DISCONNECTED with a non-OK error;
+ * a disconnect you initiate yourself reports ERROR_ok, so it is left alone. */
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus,
                                           unsigned int errorNumber) {
-    (void)errorNumber;
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
+        InterlockedExchange(&g_rejoinAttempts, 0);
         if (selfLock) {
+            /* if this connect was a rejoin, hop back to the channel we were kicked from */
+            if (InterlockedExchange(&g_restoreChannel, 0) == 1) {
+                std::string path;
+                EnterCriticalSection(&cs);
+                path = g_reconn.channelPath;
+                LeaveCriticalSection(&cs);
+                uint64 target = resolveChannelPath(serverConnectionHandlerID, path.c_str());
+                if (target) {
+                    ts3Functions.requestClientMove(serverConnectionHandlerID,
+                                                   ownClient(serverConnectionHandlerID),
+                                                   target, "", NULL);
+                    logDiag("rejoin: back on the server, moving to your channel");
+                } else {
+                    logDiag("rejoin: back on the server (couldn't resolve saved channel)");
+                }
+            }
             uint64 ch = 0;
             ts3Functions.getChannelOfClient(serverConnectionHandlerID,
                                             ownClient(serverConnectionHandlerID), &ch);
@@ -1163,10 +1258,30 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
             LeaveCriticalSection(&cs);
             captureReconnectInfo(serverConnectionHandlerID, 0);
         }
-    } else if (newStatus == STATUS_DISCONNECTED) {
-        if (selfLock && InterlockedExchange(&g_pendingRejoin, 0) == 1)
-            scheduleRejoin();
+        return;
     }
+
+    if (newStatus != STATUS_DISCONNECTED) return;
+    if (!selfLock) return;
+
+    bool infoValid;
+    EnterCriticalSection(&cs);
+    infoValid = g_reconn.valid;
+    LeaveCriticalSection(&cs);
+
+    char dbg[160];
+    _snprintf(dbg, sizeof(dbg), "disconnected: err=0x%04x infoValid=%d", errorNumber, (int)infoValid);
+    logDiag(dbg);
+
+    if (errorNumber == ERROR_ok) { logDiag("clean disconnect (you left) - not reconnecting"); return; }
+    if (!infoValid)              { logDiag("no reconnect info - not reconnecting"); return; }
+
+    if (InterlockedIncrement(&g_rejoinAttempts) > 5) {
+        logDiag("gave up rejoining after 5 tries (banned or server down?)");
+        return;
+    }
+    InterlockedExchange(&g_restoreChannel, 1);
+    scheduleRejoin();
 }
 
 /* ------------------------------------------------------------------ */
