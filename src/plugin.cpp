@@ -48,7 +48,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.9"
+#define PLUGIN_VERSION "2.0"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -94,6 +94,7 @@ struct Settings {
     int  autoPokeBackTimes;/* pokes per auto-poke-back   */
     int  talkPokeTimes;    /* pokes each time a watched user starts talking */
     int  talkDelayMs;      /* delay before a talk reaction fires; 0 = instant */
+    int  selfLockOn;       /* 0/1: persisted; auto-arms self-lock on every connect */
     char customMsg[256];
     char talkPokeMsg[256]; /* dedicated talk-poke text; blank = use poke settings */
     std::vector<std::string> randomMsgs;
@@ -125,10 +126,8 @@ struct ReconnectInfo {
 };
 static ReconnectInfo g_reconn = {};
 static volatile LONG g_rejoinAttempts = 0;   /* capped so a ban / dead server can't loop forever */
-static volatile LONG g_restoreChannel = 0;   /* after a rejoin, move back to the saved channel */
 static volatile LONG g_myId = 0;             /* my client id on the locked connection */
 static volatile LONG g_kickFlag = 0;         /* set when I was kicked from the SERVER */
-static char          g_restorePath[512] = {};/* channel to return to after a rejoin (guarded by cs) */
 
 /* Delayed-reaction plumbing (so talk reactions can wait a beat) */
 static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
@@ -146,6 +145,7 @@ static void setDefaults() {
     g.autoPokeBackTimes= 3;
     g.talkPokeTimes    = 1;
     g.talkDelayMs      = 1000;   /* 1s so the victim gets a word out first */
+    g.selfLockOn       = 0;
     strcpy(g.customMsg, "stop ignoring me!");
     g.talkPokeMsg[0]   = '\0';   /* blank = fall back to poke settings */
     g.randomMsgs.clear();
@@ -181,6 +181,7 @@ static void loadSettings() {
     g.autoPokeBackTimes= GetPrivateProfileIntA("react", "autoPokeBackTimes", g.autoPokeBackTimes, ini);
     g.talkPokeTimes    = GetPrivateProfileIntA("react", "talkPokeTimes", g.talkPokeTimes, ini);
     g.talkDelayMs      = GetPrivateProfileIntA("react", "talkDelayMs",   g.talkDelayMs, ini);
+    g.selfLockOn       = GetPrivateProfileIntA("selflock", "on",        g.selfLockOn, ini);
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
     GetPrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, g.talkPokeMsg, sizeof(g.talkPokeMsg), ini);
 
@@ -228,6 +229,9 @@ static void saveSettings() {
     _snprintf(num, sizeof(num), "%d", g.talkDelayMs);
     WritePrivateProfileStringA("react", "talkDelayMs", num, ini);
     WritePrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, ini);
+
+    _snprintf(num, sizeof(num), "%d", g.selfLockOn);
+    WritePrivateProfileStringA("selflock", "on", num, ini);
 
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
     WritePrivateProfileStringA("poke", "randomCount", num, ini);
@@ -679,62 +683,6 @@ static void captureReconnectInfo(uint64 sch, uint64 channelOverride) {
     LeaveCriticalSection(&cs);
 }
 
-/* collect (name,uuid) of every server bookmark, descending into folders */
-static void collectBookmarks(struct PluginBookmarkList* list,
-                             std::vector<std::pair<std::string, std::string> >& out) {
-    if (!list) return;
-    for (int i = 0; i < list->itemcount; ++i) {
-        struct PluginBookmarkItem& it = list->items[i];
-        if (it.isFolder) {
-            collectBookmarks(it.folder, out);
-        } else if (it.name && it.uuid) {
-            out.push_back(std::make_pair(std::string(it.name), std::string(it.uuid)));
-        }
-    }
-}
-
-/* find the bookmark uuid to reconnect with: prefer a name matching the server,
- * else the only bookmark if there's just one. Returns "" if none suitable. */
-static std::string findBookmarkUuid(const char* serverName) {
-    std::string uuid;
-    struct PluginBookmarkList* list = NULL;
-    if (ts3Functions.getBookmarkList(&list) != ERROR_ok || !list) return uuid;
-
-    std::vector<std::pair<std::string, std::string> > bms;
-    collectBookmarks(list, bms);
-    ts3Functions.freeMemory(list);
-
-    if (serverName && serverName[0]) {
-        for (size_t i = 0; i < bms.size(); ++i)
-            if (_stricmp(bms[i].first.c_str(), serverName) == 0) { uuid = bms[i].second; break; }
-    }
-    if (uuid.empty() && bms.size() == 1) uuid = bms[0].second;
-    return uuid;
-}
-
-/* resolve "Parent/Child/Leaf" to a channel id on the given connection */
-static uint64 resolveChannelPath(uint64 sch, const char* path) {
-    if (!path || !path[0]) return 0;
-    std::vector<std::string> parts;
-    std::string cur;
-    for (const char* p = path; ; ++p) {
-        if (*p == '/' || *p == '\0') {
-            if (!cur.empty()) parts.push_back(cur);
-            cur.clear();
-            if (*p == '\0') break;
-        } else {
-            cur += *p;
-        }
-    }
-    if (parts.empty()) return 0;
-    std::vector<char*> arr;
-    for (size_t i = 0; i < parts.size(); ++i) arr.push_back(const_cast<char*>(parts[i].c_str()));
-    arr.push_back(NULL);
-    uint64 id = 0;
-    ts3Functions.getChannelIDFromChannelNames(sch, &arr[0], &id);
-    return id;
-}
-
 static DWORD WINAPI rejoinThread(LPVOID p) {
     (void)p;
     /* brief settle time after the disconnect; bail if shutting down */
@@ -748,17 +696,16 @@ static DWORD WINAPI rejoinThread(LPVOID p) {
     LeaveCriticalSection(&cs);
 
     if (info.valid) {
+        char dbg[700];
+        _snprintf(dbg, sizeof(dbg), "rejoin: reconnecting to %s, channel '%s'",
+                  info.address, info.channelPath);
+        logDiag(dbg);
         uint64 newsch = 0;
-        std::string uuid = findBookmarkUuid(info.serverName);
-        if (!uuid.empty()) {
-            logDiag("rejoin: connecting via bookmark (keeps your identity)");
-            ts3Functions.guiConnectBookmark(PLUGIN_CONNECT_TAB_CURRENT, uuid.c_str(), &newsch);
-        } else {
-            logDiag("rejoin: no matching bookmark; connecting via address");
-            ts3Functions.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, "", info.address, info.password,
-                                    info.nickname, info.channelPath, "",
-                                    "", "", "", "", "", "", "", &newsch);
-        }
+        /* guiConnect takes the target channel directly, so the client joins the
+         * right channel as part of connecting - no bookmark walk, no second thread. */
+        ts3Functions.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, "", info.address, info.password,
+                                info.nickname, info.channelPath, "",
+                                "", "", "", "", "", "", "", &newsch);
     } else {
         logDiag("rejoin: no reconnect info captured; skipping");
     }
@@ -771,51 +718,6 @@ static void scheduleRejoin() {
     HANDLE h = CreateThread(NULL, 0, rejoinThread, NULL, 0, NULL);
     if (h) CloseHandle(h);
     else InterlockedDecrement(&g_pending);
-}
-
-/* After a rejoin the channel list may still be loading, so retry the move
- * a few times. Uses g_restorePath (snapshotted before the reconnect). */
-struct RestoreCtx { uint64 sch; };
-
-static DWORD WINAPI restoreChannelThread(LPVOID p) {
-    uint64 sch = ((RestoreCtx*)p)->sch;
-    free(p);
-
-    std::string path;
-    EnterCriticalSection(&cs);
-    path = g_restorePath;
-    LeaveCriticalSection(&cs);
-
-    if (path.empty()) {
-        logDiag("restore: no saved channel to return to");
-        InterlockedDecrement(&g_pending);
-        return 0;
-    }
-
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        if (WaitForSingleObject(g_shutdownEvent, attempt == 0 ? 700 : 500) == WAIT_OBJECT_0) break;
-        uint64 target = resolveChannelPath(sch, path.c_str());
-        char dbg[256];
-        _snprintf(dbg, sizeof(dbg), "restore try %d: '%s' -> id=%llu",
-                  attempt + 1, path.c_str(), (unsigned long long)target);
-        logDiag(dbg);
-        if (target != 0) {
-            ts3Functions.requestClientMove(sch, ownClient(sch), target, "", NULL);
-            logDiag("restore: moved back to your channel");
-            break;
-        }
-    }
-    InterlockedDecrement(&g_pending);
-    return 0;
-}
-
-static void scheduleRestore(uint64 sch) {
-    RestoreCtx* c = (RestoreCtx*)malloc(sizeof(RestoreCtx));
-    c->sch = sch;
-    InterlockedIncrement(&g_pending);
-    HANDLE h = CreateThread(NULL, 0, restoreChannelThread, c, 0, NULL);
-    if (h) CloseHandle(h);
-    else { InterlockedDecrement(&g_pending); free(c); }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1165,16 +1067,20 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         selfLockSch = serverConnectionHandlerID;
         selfLockChannel = ch;
         LeaveCriticalSection(&cs);
+        g.selfLockOn = 1;                                      /* persist + auto-arm next time */
+        saveSettings();
         captureReconnectInfo(serverConnectionHandlerID, 0);   /* enable server-kick rejoin */
         ts3Functions.printMessageToCurrentTab(
-            "[Fun Plugin] Self-lock ON: if anyone moves, channel-kicks, or SERVER-kicks you, "
-            "you'll come right back. (You can still switch channels yourself.)");
+            "[Fun Plugin] Self-lock ON (stays on across restarts): if anyone moves, channel-kicks, "
+            "or SERVER-kicks you, you'll come right back. (You can still switch channels yourself.)");
         break;
     }
     case MENU_SELFLOCK_OFF:
         EnterCriticalSection(&cs);
         selfLock = 0;
         LeaveCriticalSection(&cs);
+        g.selfLockOn = 0;
+        saveSettings();
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Self-lock OFF.");
         break;
     }
@@ -1316,12 +1222,8 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
                                           unsigned int errorNumber) {
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
         InterlockedExchange(&g_rejoinAttempts, 0);
-        if (selfLock) {
-            /* if this connect was a rejoin, return to the saved channel (on a retry
-             * thread, since the channel list may still be loading right now) */
-            if (InterlockedExchange(&g_restoreChannel, 0) == 1)
-                scheduleRestore(serverConnectionHandlerID);
-
+        if (g.selfLockOn) {
+            InterlockedExchange(&selfLock, 1);   /* auto-arm self-lock on every (re)connect */
             uint64 ch = 0;
             ts3Functions.getChannelOfClient(serverConnectionHandlerID,
                                             ownClient(serverConnectionHandlerID), &ch);
@@ -1356,19 +1258,6 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
         logDiag("gave up rejoining after 5 tries (banned or server down?)");
         return;
     }
-
-    /* remember the channel we were in so we can return to it after reconnecting */
-    EnterCriticalSection(&cs);
-    strncpy(g_restorePath, g_reconn.channelPath, sizeof(g_restorePath) - 1);
-    g_restorePath[sizeof(g_restorePath) - 1] = '\0';
-    LeaveCriticalSection(&cs);
-    {
-        char dbg[256];
-        _snprintf(dbg, sizeof(dbg), "will rejoin; saved channel = '%s'", g_restorePath);
-        logDiag(dbg);
-    }
-
-    InterlockedExchange(&g_restoreChannel, 1);
     scheduleRejoin();
 }
 
