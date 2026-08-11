@@ -48,7 +48,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.7"
+#define PLUGIN_VERSION "1.8"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -126,6 +126,8 @@ struct ReconnectInfo {
 static ReconnectInfo g_reconn = {};
 static volatile LONG g_rejoinAttempts = 0;   /* capped so a ban / dead server can't loop forever */
 static volatile LONG g_restoreChannel = 0;   /* after a rejoin, move back to the saved channel */
+static volatile LONG g_myId = 0;             /* my client id on the locked connection */
+static volatile LONG g_kickFlag = 0;         /* set when I was kicked from the SERVER */
 
 /* Delayed-reaction plumbing (so talk reactions can wait a beat) */
 static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
@@ -654,6 +656,8 @@ static void captureReconnectInfo(uint64 sch, uint64 channelOverride) {
         sname = sv;
         ts3Functions.freeMemory(sv);
     }
+
+    InterlockedExchange(&g_myId, (LONG)ownClient(sch));
 
     uint64 ch = channelOverride;
     if (ch == 0) ts3Functions.getChannelOfClient(sch, ownClient(sch), &ch);
@@ -1225,9 +1229,41 @@ void ts3plugin_onClientKickFromChannelEvent(uint64 serverConnectionHandlerID, an
                      kickerID != ownClient(serverConnectionHandlerID));
 }
 
-/* Connection state changes drive the server-kick recovery.
- * A server kick shows up here as STATUS_DISCONNECTED with a non-OK error;
- * a disconnect you initiate yourself reports ERROR_ok, so it is left alone. */
+/* A real server kick of my own client sets the kick flag (consumed on disconnect). */
+void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, anyID clientID,
+                                           uint64 oldChannelID, uint64 newChannelID, int visibility,
+                                           anyID kickerID, const char* kickerName,
+                                           const char* kickerUniqueIdentifier, const char* kickMessage) {
+    (void)newChannelID; (void)visibility; (void)kickerName; (void)kickerUniqueIdentifier;
+    anyID meNow = ownClient(serverConnectionHandlerID);
+    char dbg[224];
+    _snprintf(dbg, sizeof(dbg),
+              "KICKFROMSERVER fired: clientID=%u myId=%d ownNow=%u kicker=%u reason=%s",
+              (unsigned)clientID, (int)g_myId, (unsigned)meNow, (unsigned)kickerID,
+              kickMessage ? kickMessage : "");
+    logDiag(dbg);
+    if (!selfLock) return;
+    if (clientID == (anyID)g_myId || clientID == meNow) {
+        captureReconnectInfo(serverConnectionHandlerID, oldChannelID);
+        InterlockedExchange(&g_kickFlag, 1);
+        logDiag("KICKFROMSERVER: that's me -> will rejoin after disconnect");
+    }
+}
+
+/* Log server errors too, in case a kick surfaces here instead. */
+int ts3plugin_onServerErrorEvent(uint64 serverConnectionHandlerID, const char* errorMessage,
+                                 unsigned int error, const char* returnCode, const char* extraMessage) {
+    (void)serverConnectionHandlerID; (void)returnCode;
+    char dbg[256];
+    _snprintf(dbg, sizeof(dbg), "SERVERERROR: error=0x%04x msg=%s extra=%s",
+              error, errorMessage ? errorMessage : "", extraMessage ? extraMessage : "");
+    logDiag(dbg);
+    return 0;   /* let the client handle it normally */
+}
+
+/* Connection state changes drive the server-kick recovery. A voluntary
+ * disconnect and a kick BOTH report err=0x0000, so we rely on g_kickFlag
+ * (set by onClientKickFromServerEvent) to tell them apart. */
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus,
                                           unsigned int errorNumber) {
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
@@ -1262,6 +1298,8 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     }
 
     if (newStatus != STATUS_DISCONNECTED) return;
+
+    bool kicked = (InterlockedExchange(&g_kickFlag, 0) == 1);
     if (!selfLock) return;
 
     bool infoValid;
@@ -1270,11 +1308,12 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     LeaveCriticalSection(&cs);
 
     char dbg[160];
-    _snprintf(dbg, sizeof(dbg), "disconnected: err=0x%04x infoValid=%d", errorNumber, (int)infoValid);
+    _snprintf(dbg, sizeof(dbg), "disconnected: err=0x%04x kicked=%d infoValid=%d",
+              errorNumber, (int)kicked, (int)infoValid);
     logDiag(dbg);
 
-    if (errorNumber == ERROR_ok) { logDiag("clean disconnect (you left) - not reconnecting"); return; }
-    if (!infoValid)              { logDiag("no reconnect info - not reconnecting"); return; }
+    if (!kicked)    { logDiag("no kick signal - not reconnecting (voluntary disconnect?)"); return; }
+    if (!infoValid) { logDiag("kicked but no reconnect info - not reconnecting"); return; }
 
     if (InterlockedIncrement(&g_rejoinAttempts) > 5) {
         logDiag("gave up rejoining after 5 tries (banned or server down?)");
