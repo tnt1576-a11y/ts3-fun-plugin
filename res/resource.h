@@ -28,6 +28,7 @@
 #define IDC_APB_TIMES       1031  /* edit: pokes per auto-poke-back          */
 #define IDC_TALK_TIMES      1032  /* edit: pokes per talk trigger            */
 #define IDC_TALK_MSG        1033  /* edit: dedicated talk-poke message       */
+#define IDC_TALK_DELAY      1034  /* edit: delay before a talk reaction fires */
 
 /* Static labels (no logic, just layout) */
 #define IDC_LBL_MOVE        1100

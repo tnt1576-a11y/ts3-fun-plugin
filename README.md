@@ -63,7 +63,18 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 **Right-click a CHANNEL** (group actions on everyone in it):
 - **Random Move / Poke / Chaos everyone here**
 
-**Global plugin menu:** **Settings...** and **HARD STOP - stop everything**.
+**Global plugin menu:** **Settings...**, **HARD STOP - stop everything**, and
+**Self-lock: ON / OFF**.
+
+**Self-lock** protects *you*: while ON, if anyone force-moves or channel-kicks you out
+of your channel, you snap right back. You can still switch channels yourself (that just
+re-anchors the lock to wherever you go). Turn it OFF from the same menu. It's session-only
+and unaffected by HARD STOP.
+
+**Talk reaction delay:** talk-poke and talk-move wait a configurable delay (default 1s,
+Settings > Reactions) before firing, so the person gets a word out before it hits. Set
+it to 0 for instant.
+
 HARD STOP is the failsafe — it stops **all** activity: the move/poke/chaos jobs (however
 they were started), **disarms every talk-poke** target, and **turns off auto-poke-back**
 for the session (re-enable it in Settings). The individual *Stop* items only stop their

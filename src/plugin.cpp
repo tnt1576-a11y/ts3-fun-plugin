@@ -46,7 +46,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.4"
+#define PLUGIN_VERSION "1.5"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -66,7 +66,9 @@ enum {
     MENU_POKE_START_CH,
     MENU_CHAOS_START_CH,
     MENU_SETTINGS,
-    MENU_HARDSTOP
+    MENU_HARDSTOP,
+    MENU_SELFLOCK_ON,     /* global: lock myself into my current channel */
+    MENU_SELFLOCK_OFF
 };
 
 /* "No empty channel" behaviour */
@@ -89,6 +91,7 @@ struct Settings {
     int  autoPokeBack;     /* 0/1: poke back when poked  */
     int  autoPokeBackTimes;/* pokes per auto-poke-back   */
     int  talkPokeTimes;    /* pokes each time a watched user starts talking */
+    int  talkDelayMs;      /* delay before a talk reaction fires; 0 = instant */
     char customMsg[256];
     char talkPokeMsg[256]; /* dedicated talk-poke text; blank = use poke settings */
     std::vector<std::string> randomMsgs;
@@ -104,6 +107,15 @@ static std::map<anyID, DWORD>   pokeBackCooldown; /* last auto-poke-back tick   
 static std::map<anyID, DWORD>   talkCooldown;     /* last talk-poke tick         */
 static std::map<anyID, DWORD>   talkMoveCooldown; /* last talk-move tick         */
 
+/* Self-lock: pin my own client into a channel (guarded by cs) */
+static volatile LONG selfLock = 0;
+static uint64        selfLockSch = 0;
+static uint64        selfLockChannel = 0;
+
+/* Delayed-reaction plumbing (so talk reactions can wait a beat) */
+static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
+static volatile LONG g_pending = 0;            /* outstanding delayed-reaction threads    */
+
 static void setDefaults() {
     g.moveIntervalMs   = 5000;
     g.noEmptyMode      = NE_ASK;
@@ -115,6 +127,7 @@ static void setDefaults() {
     g.autoPokeBack     = 0;
     g.autoPokeBackTimes= 3;
     g.talkPokeTimes    = 1;
+    g.talkDelayMs      = 1000;   /* 1s so the victim gets a word out first */
     strcpy(g.customMsg, "stop ignoring me!");
     g.talkPokeMsg[0]   = '\0';   /* blank = fall back to poke settings */
     g.randomMsgs.clear();
@@ -149,6 +162,7 @@ static void loadSettings() {
     g.autoPokeBack     = GetPrivateProfileIntA("react", "autoPokeBack",  g.autoPokeBack, ini);
     g.autoPokeBackTimes= GetPrivateProfileIntA("react", "autoPokeBackTimes", g.autoPokeBackTimes, ini);
     g.talkPokeTimes    = GetPrivateProfileIntA("react", "talkPokeTimes", g.talkPokeTimes, ini);
+    g.talkDelayMs      = GetPrivateProfileIntA("react", "talkDelayMs",   g.talkDelayMs, ini);
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
     GetPrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, g.talkPokeMsg, sizeof(g.talkPokeMsg), ini);
 
@@ -193,6 +207,8 @@ static void saveSettings() {
     WritePrivateProfileStringA("react", "autoPokeBackTimes", num, ini);
     _snprintf(num, sizeof(num), "%d", g.talkPokeTimes);
     WritePrivateProfileStringA("react", "talkPokeTimes", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.talkDelayMs);
+    WritePrivateProfileStringA("react", "talkDelayMs", num, ini);
     WritePrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, ini);
 
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
@@ -497,6 +513,76 @@ static void hardStop() {
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
 
 /* ------------------------------------------------------------------ */
+/* Delayed talk reactions                                             */
+/* ------------------------------------------------------------------ */
+
+struct DelayedReaction {
+    uint64 sch;
+    anyID  client;
+    int    delayMs;
+    bool   doPoke;  int pokeN;  bool useMsg;  char msg[256];
+    bool   doMove;  int moveAll;
+};
+
+static DWORD WINAPI reactionThread(LPVOID p) {
+    DelayedReaction* d = (DelayedReaction*)p;
+    /* wait out the delay, but bail immediately if the plugin is shutting down */
+    if (WaitForSingleObject(g_shutdownEvent, d->delayMs) == WAIT_TIMEOUT) {
+        if (d->doPoke) {
+            if (d->useMsg) pokeTimesMsg(d->sch, d->client, d->pokeN, d->msg);
+            else           pokeTimes(d->sch, d->client, d->pokeN);
+        }
+        if (d->doMove) {
+            Job tmp{};
+            tmp.sch = d->sch;
+            tmp.targets.push_back(d->client);
+            tmp.allChannels = d->moveAll;
+            doOneMove(&tmp);
+        }
+    }
+    free(d);
+    InterlockedDecrement(&g_pending);
+    return 0;
+}
+
+static void scheduleReaction(const DelayedReaction& src) {
+    DelayedReaction* d = (DelayedReaction*)malloc(sizeof(DelayedReaction));
+    *d = src;
+    InterlockedIncrement(&g_pending);
+    HANDLE h = CreateThread(NULL, 0, reactionThread, d, 0, NULL);
+    if (h) CloseHandle(h);
+    else { InterlockedDecrement(&g_pending); free(d); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Self-lock (anti-move for my own client)                            */
+/* ------------------------------------------------------------------ */
+
+/* forcedByOther == true  -> someone moved/kicked me: snap back to the lock channel
+ * forcedByOther == false -> I moved myself: re-anchor the lock to where I went  */
+static void selfMovedHandler(uint64 sch, anyID clientID, uint64 newCh, bool forcedByOther) {
+    LONG   locked;
+    uint64 lockSch, lockCh;
+    EnterCriticalSection(&cs);
+    locked  = selfLock;
+    lockSch = selfLockSch;
+    lockCh  = selfLockChannel;
+    LeaveCriticalSection(&cs);
+
+    if (!locked || sch != lockSch) return;
+    if (clientID != ownClient(sch)) return;
+
+    if (forcedByOther) {
+        if (newCh != lockCh)
+            ts3Functions.requestClientMove(sch, clientID, lockCh, "", NULL);   /* snap back */
+    } else {
+        EnterCriticalSection(&cs);
+        if (selfLock && sch == selfLockSch) selfLockChannel = newCh;            /* re-anchor */
+        LeaveCriticalSection(&cs);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Settings dialog                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -531,6 +617,17 @@ static int getDlgMs(HWND h, int id, int fallbackMs) {
     return ms;
 }
 
+/* like getDlgMs but allows 0 = instant (used for the talk reaction delay) */
+static int getDlgDelayMs(HWND h, int id, int fallbackMs) {
+    char buf[32];
+    buf[0] = '\0';
+    GetDlgItemTextA(h, id, buf, sizeof(buf));
+    if (buf[0] == '\0') return fallbackMs;
+    double s = atof(buf);
+    if (s <= 0) return 0;
+    return (int)(s * 1000.0 + 0.5);
+}
+
 static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_INITDIALOG: {
@@ -550,6 +647,7 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
         CheckDlgButton(hDlg, IDC_AUTOPOKEBACK, g.autoPokeBack ? BST_CHECKED : BST_UNCHECKED);
         setDlgInt(hDlg, IDC_APB_TIMES, g.autoPokeBackTimes);
         setDlgInt(hDlg, IDC_TALK_TIMES, g.talkPokeTimes);
+        setDlgSec(hDlg, IDC_TALK_DELAY, g.talkDelayMs);
         SetDlgItemTextA(hDlg, IDC_TALK_MSG, g.talkPokeMsg);
 
         setDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
@@ -587,6 +685,7 @@ static INT_PTR CALLBACK settingsProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
             g.talkPokeTimes = getDlgInt(hDlg, IDC_TALK_TIMES, g.talkPokeTimes);
             if (g.talkPokeTimes < 1)   g.talkPokeTimes = 1;
             if (g.talkPokeTimes > 100) g.talkPokeTimes = 100;
+            g.talkDelayMs = getDlgDelayMs(hDlg, IDC_TALK_DELAY, g.talkDelayMs);
             GetDlgItemTextA(hDlg, IDC_TALK_MSG, g.talkPokeMsg, sizeof(g.talkPokeMsg));
 
             g.limiterSec = getDlgInt(hDlg, IDC_LIMITER, g.limiterSec);
@@ -655,12 +754,19 @@ void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) {
 
 int ts3plugin_init() {
     InitializeCriticalSection(&cs);
+    g_shutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);   /* manual reset */
     srand((unsigned)time(NULL));
     loadSettings();
     return 0;   /* success */
 }
 
 void ts3plugin_shutdown() {
+    InterlockedExchange(&selfLock, 0);
+
+    /* cancel and drain any pending delayed reactions before we lose ts3Functions */
+    if (g_shutdownEvent) SetEvent(g_shutdownEvent);
+    for (int i = 0; i < 300 && g_pending > 0; ++i) Sleep(10);   /* up to ~3s */
+
     stopAllJobs();
     EnterCriticalSection(&cs);
     talkTargets.clear();
@@ -670,6 +776,11 @@ void ts3plugin_shutdown() {
     talkMoveCooldown.clear();
     LeaveCriticalSection(&cs);
     DeleteCriticalSection(&cs);
+
+    if (g_shutdownEvent) {
+        CloseHandle(g_shutdownEvent);
+        g_shutdownEvent = NULL;
+    }
     if (pluginID) {
         free(pluginID);
         pluginID = NULL;
@@ -696,7 +807,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 15;
+    const int count = 17;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -717,6 +828,8 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     /* Global plugin menu */
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SETTINGS,       "Settings...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_HARDSTOP,       "HARD STOP - stop everything");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SELFLOCK_ON,    "Self-lock: ON (can't be moved out)");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SELFLOCK_OFF,   "Self-lock: OFF");
     (*menuItems)[n++] = NULL;
 
     *menuIcon = NULL;
@@ -807,6 +920,26 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
     case MENU_HARDSTOP:
         hardStop();
         break;
+    case MENU_SELFLOCK_ON: {
+        anyID me = ownClient(serverConnectionHandlerID);
+        uint64 ch = 0;
+        ts3Functions.getChannelOfClient(serverConnectionHandlerID, me, &ch);
+        EnterCriticalSection(&cs);
+        selfLock = 1;
+        selfLockSch = serverConnectionHandlerID;
+        selfLockChannel = ch;
+        LeaveCriticalSection(&cs);
+        ts3Functions.printMessageToCurrentTab(
+            "[Fun Plugin] Self-lock ON: if anyone moves or channel-kicks you, you'll snap right back. "
+            "(You can still switch channels yourself.)");
+        break;
+    }
+    case MENU_SELFLOCK_OFF:
+        EnterCriticalSection(&cs);
+        selfLock = 0;
+        LeaveCriticalSection(&cs);
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Self-lock OFF.");
+        break;
     }
 }
 
@@ -838,44 +971,71 @@ void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int sta
     (void)isReceivedWhisper;
     if (status != STATUS_TALKING) return;
 
-    bool doPoke = false;
-    int  times  = 0;
-    bool doMove = false;
-    int  moveAll = 0;
+    DelayedReaction d = {};
+    d.sch = serverConnectionHandlerID;
+    d.client = clientID;
+    bool any = false;
     DWORD now = GetTickCount();
 
     EnterCriticalSection(&cs);
+    d.delayMs = g.talkDelayMs;
     if (talkTargets.count(clientID)) {
         DWORD last = talkCooldown[clientID];
-        if ((last == 0) || ((now - last) > 1000)) {   /* at most one burst/sec per user */
-            doPoke = true;
+        if ((last == 0) || ((now - last) > 1000)) {   /* at most one trigger/sec per user */
             talkCooldown[clientID] = now;
-            times = g.talkPokeTimes;
+            d.doPoke = true;
+            d.pokeN = g.talkPokeTimes;
+            d.useMsg = (g.talkPokeMsg[0] != 0);
+            if (d.useMsg) {
+                strncpy(d.msg, g.talkPokeMsg, sizeof(d.msg) - 1);
+                d.msg[sizeof(d.msg) - 1] = '\0';
+            }
+            any = true;
         }
     }
     if (talkMoveTargets.count(clientID)) {
         DWORD last = talkMoveCooldown[clientID];
         if ((last == 0) || ((now - last) > 1000)) {
-            doMove = true;
             talkMoveCooldown[clientID] = now;
-            moveAll = (g.noEmptyMode == NE_ALL) ? 1 : 0;   /* same setting; never prompts here */
+            d.doMove = true;
+            d.moveAll = (g.noEmptyMode == NE_ALL) ? 1 : 0;   /* same setting; never prompts here */
+            any = true;
         }
     }
     LeaveCriticalSection(&cs);
 
-    if (doPoke) {
-        if (g.talkPokeMsg[0])
-            pokeTimesMsg(serverConnectionHandlerID, clientID, times, g.talkPokeMsg);
-        else
-            pokeTimes(serverConnectionHandlerID, clientID, times);
-    }
-    if (doMove) {
-        Job tmp{};                     /* transient single-target job, reuses doOneMove */
-        tmp.sch = serverConnectionHandlerID;
-        tmp.targets.push_back(clientID);
-        tmp.allChannels = moveAll;
-        doOneMove(&tmp);
-    }
+    /* fire after the configured delay so the victim gets a word out first */
+    if (any) scheduleReaction(d);
+}
+
+/* ---- Self-lock: react to my own client being moved/kicked ---- */
+
+void ts3plugin_onClientMoveEvent(uint64 serverConnectionHandlerID, anyID clientID,
+                                 uint64 oldChannelID, uint64 newChannelID,
+                                 int visibility, const char* moveMessage) {
+    (void)oldChannelID; (void)visibility; (void)moveMessage;
+    /* a plain move event is a voluntary/self switch -> re-anchor */
+    selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID, false);
+}
+
+void ts3plugin_onClientMoveMovedEvent(uint64 serverConnectionHandlerID, anyID clientID,
+                                      uint64 oldChannelID, uint64 newChannelID, int visibility,
+                                      anyID moverID, const char* moverName,
+                                      const char* moverUniqueIdentifier, const char* moveMessage) {
+    (void)oldChannelID; (void)visibility; (void)moverName;
+    (void)moverUniqueIdentifier; (void)moveMessage;
+    selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID,
+                     moverID != ownClient(serverConnectionHandlerID));
+}
+
+void ts3plugin_onClientKickFromChannelEvent(uint64 serverConnectionHandlerID, anyID clientID,
+                                            uint64 oldChannelID, uint64 newChannelID, int visibility,
+                                            anyID kickerID, const char* kickerName,
+                                            const char* kickerUniqueIdentifier, const char* kickMessage) {
+    (void)oldChannelID; (void)visibility; (void)kickerName;
+    (void)kickerUniqueIdentifier; (void)kickMessage;
+    selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID,
+                     kickerID != ownClient(serverConnectionHandlerID));
 }
 
 /* ------------------------------------------------------------------ */
