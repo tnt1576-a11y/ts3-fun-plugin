@@ -48,7 +48,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.8"
+#define PLUGIN_VERSION "1.9"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -128,6 +128,7 @@ static volatile LONG g_rejoinAttempts = 0;   /* capped so a ban / dead server ca
 static volatile LONG g_restoreChannel = 0;   /* after a rejoin, move back to the saved channel */
 static volatile LONG g_myId = 0;             /* my client id on the locked connection */
 static volatile LONG g_kickFlag = 0;         /* set when I was kicked from the SERVER */
+static char          g_restorePath[512] = {};/* channel to return to after a rejoin (guarded by cs) */
 
 /* Delayed-reaction plumbing (so talk reactions can wait a beat) */
 static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
@@ -772,6 +773,51 @@ static void scheduleRejoin() {
     else InterlockedDecrement(&g_pending);
 }
 
+/* After a rejoin the channel list may still be loading, so retry the move
+ * a few times. Uses g_restorePath (snapshotted before the reconnect). */
+struct RestoreCtx { uint64 sch; };
+
+static DWORD WINAPI restoreChannelThread(LPVOID p) {
+    uint64 sch = ((RestoreCtx*)p)->sch;
+    free(p);
+
+    std::string path;
+    EnterCriticalSection(&cs);
+    path = g_restorePath;
+    LeaveCriticalSection(&cs);
+
+    if (path.empty()) {
+        logDiag("restore: no saved channel to return to");
+        InterlockedDecrement(&g_pending);
+        return 0;
+    }
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (WaitForSingleObject(g_shutdownEvent, attempt == 0 ? 700 : 500) == WAIT_OBJECT_0) break;
+        uint64 target = resolveChannelPath(sch, path.c_str());
+        char dbg[256];
+        _snprintf(dbg, sizeof(dbg), "restore try %d: '%s' -> id=%llu",
+                  attempt + 1, path.c_str(), (unsigned long long)target);
+        logDiag(dbg);
+        if (target != 0) {
+            ts3Functions.requestClientMove(sch, ownClient(sch), target, "", NULL);
+            logDiag("restore: moved back to your channel");
+            break;
+        }
+    }
+    InterlockedDecrement(&g_pending);
+    return 0;
+}
+
+static void scheduleRestore(uint64 sch) {
+    RestoreCtx* c = (RestoreCtx*)malloc(sizeof(RestoreCtx));
+    c->sch = sch;
+    InterlockedIncrement(&g_pending);
+    HANDLE h = CreateThread(NULL, 0, restoreChannelThread, c, 0, NULL);
+    if (h) CloseHandle(h);
+    else { InterlockedDecrement(&g_pending); free(c); }
+}
+
 /* ------------------------------------------------------------------ */
 /* Settings dialog                                                    */
 /* ------------------------------------------------------------------ */
@@ -1234,7 +1280,8 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
                                            uint64 oldChannelID, uint64 newChannelID, int visibility,
                                            anyID kickerID, const char* kickerName,
                                            const char* kickerUniqueIdentifier, const char* kickMessage) {
-    (void)newChannelID; (void)visibility; (void)kickerName; (void)kickerUniqueIdentifier;
+    (void)oldChannelID; (void)newChannelID; (void)visibility;
+    (void)kickerName; (void)kickerUniqueIdentifier;
     anyID meNow = ownClient(serverConnectionHandlerID);
     char dbg[224];
     _snprintf(dbg, sizeof(dbg),
@@ -1244,7 +1291,8 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
     logDiag(dbg);
     if (!selfLock) return;
     if (clientID == (anyID)g_myId || clientID == meNow) {
-        captureReconnectInfo(serverConnectionHandlerID, oldChannelID);
+        /* channel is tracked continuously (connect + moves); don't recapture here
+         * because the client is already tearing down and would clobber it. */
         InterlockedExchange(&g_kickFlag, 1);
         logDiag("KICKFROMSERVER: that's me -> will rejoin after disconnect");
     }
@@ -1269,22 +1317,11 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
         InterlockedExchange(&g_rejoinAttempts, 0);
         if (selfLock) {
-            /* if this connect was a rejoin, hop back to the channel we were kicked from */
-            if (InterlockedExchange(&g_restoreChannel, 0) == 1) {
-                std::string path;
-                EnterCriticalSection(&cs);
-                path = g_reconn.channelPath;
-                LeaveCriticalSection(&cs);
-                uint64 target = resolveChannelPath(serverConnectionHandlerID, path.c_str());
-                if (target) {
-                    ts3Functions.requestClientMove(serverConnectionHandlerID,
-                                                   ownClient(serverConnectionHandlerID),
-                                                   target, "", NULL);
-                    logDiag("rejoin: back on the server, moving to your channel");
-                } else {
-                    logDiag("rejoin: back on the server (couldn't resolve saved channel)");
-                }
-            }
+            /* if this connect was a rejoin, return to the saved channel (on a retry
+             * thread, since the channel list may still be loading right now) */
+            if (InterlockedExchange(&g_restoreChannel, 0) == 1)
+                scheduleRestore(serverConnectionHandlerID);
+
             uint64 ch = 0;
             ts3Functions.getChannelOfClient(serverConnectionHandlerID,
                                             ownClient(serverConnectionHandlerID), &ch);
@@ -1319,6 +1356,18 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
         logDiag("gave up rejoining after 5 tries (banned or server down?)");
         return;
     }
+
+    /* remember the channel we were in so we can return to it after reconnecting */
+    EnterCriticalSection(&cs);
+    strncpy(g_restorePath, g_reconn.channelPath, sizeof(g_restorePath) - 1);
+    g_restorePath[sizeof(g_restorePath) - 1] = '\0';
+    LeaveCriticalSection(&cs);
+    {
+        char dbg[256];
+        _snprintf(dbg, sizeof(dbg), "will rejoin; saved channel = '%s'", g_restorePath);
+        logDiag(dbg);
+    }
+
     InterlockedExchange(&g_restoreChannel, 1);
     scheduleRejoin();
 }
