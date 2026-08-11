@@ -47,7 +47,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.2"
+#define PLUGIN_VERSION "2.3"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -417,10 +417,44 @@ static uint64 lastRootChannel(uint64 sch) {
 /* Create a pool of N temporary channels (<base>1..<base>N) at the end of the list.
  * Their ids are captured in onNewChannelCreatedEvent (only ones WE make, matching
  * the name pattern, during this creation window). */
+/* Creating a channel auto-joins the creator into it, so after making the pool we
+ * pull ourselves back to where we were. Retries briefly since it happens async. */
+struct ReturnCtx { uint64 sch; uint64 channel; };
+
+static DWORD WINAPI returnHomeThread(LPVOID p) {
+    ReturnCtx ctx = *(ReturnCtx*)p;
+    free(p);
+    if (ctx.channel != 0) {
+        for (int i = 0; i < 6; ++i) {
+            if (WaitForSingleObject(g_shutdownEvent, 400) == WAIT_OBJECT_0) break;
+            uint64 cur = 0;
+            ts3Functions.getChannelOfClient(ctx.sch, ownClient(ctx.sch), &cur);
+            if (cur == ctx.channel) break;                 /* back home - done */
+            ts3Functions.requestClientMove(ctx.sch, ownClient(ctx.sch), ctx.channel, "", NULL);
+        }
+    }
+    InterlockedDecrement(&g_pending);
+    return 0;
+}
+
+static void scheduleReturnHome(uint64 sch, uint64 channel) {
+    ReturnCtx* c = (ReturnCtx*)malloc(sizeof(ReturnCtx));
+    c->sch = sch;
+    c->channel = channel;
+    InterlockedIncrement(&g_pending);
+    HANDLE h = CreateThread(NULL, 0, returnHomeThread, c, 0, NULL);
+    if (h) CloseHandle(h);
+    else { InterlockedDecrement(&g_pending); free(c); }
+}
+
 static void createTempPool(uint64 sch) {
     int count = g.tempChannelCount;
     if (count < 1)  count = 1;
     if (count > 50) count = 50;
+
+    /* remember where we are so we can undo the create-auto-join afterwards */
+    uint64 home = 0;
+    ts3Functions.getChannelOfClient(sch, ownClient(sch), &home);
 
     EnterCriticalSection(&cs);
     g_tempChannels.clear();
@@ -444,6 +478,8 @@ static void createTempPool(uint64 sch) {
         if (lastRoot) ts3Functions.setChannelVariableAsUInt64(sch, 0, CHANNEL_ORDER, lastRoot);
         ts3Functions.flushChannelCreation(sch, 0, NULL);   /* parent 0 = root */
     }
+
+    scheduleReturnHome(sch, home);   /* undo the auto-join into the created channels */
 }
 
 /* Delete ONLY the channels we created. Re-checks each name against the pool
