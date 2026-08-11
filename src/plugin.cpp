@@ -46,7 +46,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "1.5"
+#define PLUGIN_VERSION "1.6"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
 
@@ -111,6 +111,17 @@ static std::map<anyID, DWORD>   talkMoveCooldown; /* last talk-move tick        
 static volatile LONG selfLock = 0;
 static uint64        selfLockSch = 0;
 static uint64        selfLockChannel = 0;
+
+/* Server-kick auto-rejoin (part of self-lock). g_reconn guarded by cs. */
+struct ReconnectInfo {
+    bool valid;
+    char address[256];      /* "host:port"        */
+    char password[256];     /* server password    */
+    char nickname[128];
+    char channelPath[512];  /* "Parent/Child/..." */
+};
+static ReconnectInfo g_reconn = {};
+static volatile LONG g_pendingRejoin = 0;   /* set by a real kick, consumed on disconnect */
 
 /* Delayed-reaction plumbing (so talk reactions can wait a beat) */
 static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
@@ -582,6 +593,89 @@ static void selfMovedHandler(uint64 sch, anyID clientID, uint64 newCh, bool forc
     }
 }
 
+/* build a channel path like "Parent/Child/Leaf" (needed by guiConnect on rejoin) */
+static std::string channelPathOf(uint64 sch, uint64 ch) {
+    std::vector<std::string> parts;
+    uint64 c = ch;
+    for (int guard = 0; c != 0 && guard < 64; ++guard) {
+        char* name = NULL;
+        if (ts3Functions.getChannelVariableAsString(sch, c, CHANNEL_NAME, &name) == ERROR_ok && name) {
+            parts.push_back(name);
+            ts3Functions.freeMemory(name);
+        }
+        uint64 parent = 0;
+        if (ts3Functions.getParentChannelOfChannel(sch, c, &parent) != ERROR_ok) break;
+        c = parent;
+    }
+    std::string path;
+    for (size_t i = parts.size(); i-- > 0; ) {
+        if (!path.empty()) path += "/";
+        path += parts[i];
+    }
+    return path;
+}
+
+/* snapshot everything needed to reconnect later (must be called while connected).
+ * channelOverride != 0 forces the channel (e.g. the kick event's oldChannelID). */
+static void captureReconnectInfo(uint64 sch, uint64 channelOverride) {
+    char host[256]; host[0] = '\0';
+    unsigned short port = 0;
+    char pw[256]; pw[0] = '\0';
+    ts3Functions.getServerConnectInfo(sch, host, &port, pw, sizeof(host));
+
+    std::string nick;
+    char* n = NULL;
+    if (ts3Functions.getClientSelfVariableAsString(sch, CLIENT_NICKNAME, &n) == ERROR_ok && n) {
+        nick = n;
+        ts3Functions.freeMemory(n);
+    }
+
+    uint64 ch = channelOverride;
+    if (ch == 0) ts3Functions.getChannelOfClient(sch, ownClient(sch), &ch);
+    std::string path = channelPathOf(sch, ch);
+
+    EnterCriticalSection(&cs);
+    g_reconn.valid = (host[0] != '\0');
+    _snprintf(g_reconn.address, sizeof(g_reconn.address), "%s:%u", host, (unsigned)port);
+    g_reconn.address[sizeof(g_reconn.address) - 1] = '\0';
+    strncpy(g_reconn.password, pw, sizeof(g_reconn.password) - 1);
+    g_reconn.password[sizeof(g_reconn.password) - 1] = '\0';
+    strncpy(g_reconn.nickname, nick.c_str(), sizeof(g_reconn.nickname) - 1);
+    g_reconn.nickname[sizeof(g_reconn.nickname) - 1] = '\0';
+    strncpy(g_reconn.channelPath, path.c_str(), sizeof(g_reconn.channelPath) - 1);
+    g_reconn.channelPath[sizeof(g_reconn.channelPath) - 1] = '\0';
+    LeaveCriticalSection(&cs);
+}
+
+static DWORD WINAPI rejoinThread(LPVOID p) {
+    (void)p;
+    /* brief settle time after the disconnect; bail if shutting down */
+    if (WaitForSingleObject(g_shutdownEvent, 500) == WAIT_OBJECT_0) {
+        InterlockedDecrement(&g_pending);
+        return 0;
+    }
+    ReconnectInfo info;
+    EnterCriticalSection(&cs);
+    info = g_reconn;
+    LeaveCriticalSection(&cs);
+
+    if (info.valid) {
+        uint64 newsch = 0;
+        ts3Functions.guiConnect(PLUGIN_CONNECT_TAB_CURRENT, "", info.address, info.password,
+                                info.nickname, info.channelPath, "",
+                                "", "", "", "", "", "", "", &newsch);
+    }
+    InterlockedDecrement(&g_pending);
+    return 0;
+}
+
+static void scheduleRejoin() {
+    InterlockedIncrement(&g_pending);
+    HANDLE h = CreateThread(NULL, 0, rejoinThread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+    else InterlockedDecrement(&g_pending);
+}
+
 /* ------------------------------------------------------------------ */
 /* Settings dialog                                                    */
 /* ------------------------------------------------------------------ */
@@ -929,9 +1023,10 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         selfLockSch = serverConnectionHandlerID;
         selfLockChannel = ch;
         LeaveCriticalSection(&cs);
+        captureReconnectInfo(serverConnectionHandlerID, 0);   /* enable server-kick rejoin */
         ts3Functions.printMessageToCurrentTab(
-            "[Fun Plugin] Self-lock ON: if anyone moves or channel-kicks you, you'll snap right back. "
-            "(You can still switch channels yourself.)");
+            "[Fun Plugin] Self-lock ON: if anyone moves, channel-kicks, or SERVER-kicks you, "
+            "you'll come right back. (You can still switch channels yourself.)");
         break;
     }
     case MENU_SELFLOCK_OFF:
@@ -1036,6 +1131,42 @@ void ts3plugin_onClientKickFromChannelEvent(uint64 serverConnectionHandlerID, an
     (void)kickerUniqueIdentifier; (void)kickMessage;
     selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID,
                      kickerID != ownClient(serverConnectionHandlerID));
+}
+
+/* Kicked from the SERVER: if it was me (by someone else), flag a rejoin. */
+void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, anyID clientID,
+                                           uint64 oldChannelID, uint64 newChannelID, int visibility,
+                                           anyID kickerID, const char* kickerName,
+                                           const char* kickerUniqueIdentifier, const char* kickMessage) {
+    (void)newChannelID; (void)visibility; (void)kickerName;
+    (void)kickerUniqueIdentifier; (void)kickMessage;
+    if (!selfLock || serverConnectionHandlerID != selfLockSch) return;
+    anyID me = ownClient(serverConnectionHandlerID);
+    if (clientID != me || kickerID == me) return;
+    /* still connected during this event: capture connect info + the channel we were in */
+    captureReconnectInfo(serverConnectionHandlerID, oldChannelID);
+    InterlockedExchange(&g_pendingRejoin, 1);
+}
+
+/* Connection state changes: keep self-lock anchored, and rejoin after a kick. */
+void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus,
+                                          unsigned int errorNumber) {
+    (void)errorNumber;
+    if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
+        if (selfLock) {
+            uint64 ch = 0;
+            ts3Functions.getChannelOfClient(serverConnectionHandlerID,
+                                            ownClient(serverConnectionHandlerID), &ch);
+            EnterCriticalSection(&cs);
+            selfLockSch = serverConnectionHandlerID;   /* re-anchor to the (re)connected server */
+            selfLockChannel = ch;
+            LeaveCriticalSection(&cs);
+            captureReconnectInfo(serverConnectionHandlerID, 0);
+        }
+    } else if (newStatus == STATUS_DISCONNECTED) {
+        if (selfLock && InterlockedExchange(&g_pendingRejoin, 0) == 1)
+            scheduleRejoin();
+    }
 }
 
 /* ------------------------------------------------------------------ */

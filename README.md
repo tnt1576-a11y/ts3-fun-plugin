@@ -67,9 +67,12 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 **Self-lock: ON / OFF**.
 
 **Self-lock** protects *you*: while ON, if anyone force-moves or channel-kicks you out
-of your channel, you snap right back. You can still switch channels yourself (that just
-re-anchors the lock to wherever you go). Turn it OFF from the same menu. It's session-only
-and unaffected by HARD STOP.
+of your channel, you snap right back. It also covers **server kicks** — if someone kicks
+you off the server, the plugin reconnects and rejoins your channel automatically (it
+captures your server address/password/nickname when you enable self-lock). You can still
+switch channels yourself (that re-anchors the lock), and a disconnect *you* initiate
+won't reconnect (only an actual kick does). A **ban** can't be undone this way. Turn it
+OFF from the same menu. Session-only and unaffected by HARD STOP.
 
 **Talk reaction delay:** talk-poke and talk-move wait a configurable delay (default 1s,
 Settings > Reactions) before firing, so the person gets a word out before it hits. Set
