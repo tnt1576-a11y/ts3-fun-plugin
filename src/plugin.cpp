@@ -33,6 +33,7 @@
 #include "resource.h"
 #include "copies.h"
 #include "tab_ui.h"
+#include "talk_back.h"
 
 /* The SDK header declares ts3plugin_apiVersion() but does not define the number;
  * the demo plugin defines it itself. 26 matches modern TS3 clients (3.5/3.6). */
@@ -49,7 +50,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.10"
+#define PLUGIN_VERSION "2.12"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
@@ -74,7 +75,10 @@ enum {
     MENU_SELFLOCK_OFF,
     MENU_COPIES,
     MENU_COPIES_CH,
-    MENU_COPIES_REMOVE
+    MENU_COPIES_REMOVE,
+    MENU_TALKBACK_START,
+    MENU_TALKBACK_STOP,
+    MENU_TALKBACK_STOP_ALL
 };
 
 /* "No empty channel" behaviour */
@@ -102,6 +106,7 @@ struct Settings {
     int  talkDelayMs;      /* delay before a talk reaction fires; 0 = instant */
     int  selfLockOn;       /* 0/1: persisted; auto-arms self-lock on every connect */
     int  copyCount;        /* remembered count; never auto-connect on startup */
+    TalkBack::Options talkBack;
     char customMsg[256];
     char talkPokeMsg[256]; /* dedicated talk-poke text; blank = use poke settings */
     std::vector<std::string> randomMsgs;
@@ -113,6 +118,9 @@ static CRITICAL_SECTION cs;   /* guards job start/stop + shared reaction state *
 static HWND g_copyWindow = NULL;
 static Copies::Manager* g_copies = NULL;   /* only accessed on the GUI thread */
 static CopyTabUI g_copyTabs;
+static CopyTabUI g_talkTabs;
+static TalkBack::Audio g_talkAudio;
+static TalkBack::Session* g_talkSession = NULL;
 static std::set<uint64> g_copyHandlers;    /* callback filter, guarded by cs */
 static volatile LONG g_copyOpening = 0;
 static const UINT WM_COPY_STATUS = WM_APP + 61;
@@ -137,17 +145,39 @@ static void copyOpening(bool opening) { InterlockedExchange(&g_copyOpening, open
 static bool copyBeforeOpen() { return g_copyTabs.begin(); }
 static bool copyAfterOpen(uint64 sch) { return g_copyTabs.end(sch); }
 static bool copyCloseTab(uint64 sch) { return g_copyTabs.close(sch); }
+static bool talkBeforeOpen() { return g_talkTabs.begin(); }
+static bool talkAfterOpen(uint64 sch) { return g_talkTabs.end(sch); }
+static bool talkCloseTab(uint64 sch) { return g_talkTabs.close(sch); }
+static void talkOwnership(uint64 sch, bool owned) {
+    copyOwnership(sch, owned);
+    if (owned) g_talkAudio.helper.store(sch);
+    else {
+        if (g_talkAudio.helper.load() == sch) g_talkAudio.helper.store(0);
+        g_talkTabs.forget(sch);
+    }
+}
+static void stopTalkBack() { if (g_talkSession) g_talkSession->stop(); }
 
 static LRESULT CALLBACK copyWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_TIMER && g_copies) {
-        g_copies->tick(GetTickCount64());
+        static bool ticking = false;
+        if (ticking) return 0;
+        ticking = true;
+        if (wParam == 1) g_copies->tick(GetTickCount64());
+        if (wParam == 2 && g_talkSession) g_talkSession->tick(GetTickCount64());
+        ticking = false;
         return 0;
     }
     if (message == WM_COPY_STATUS && g_copies) {
         g_copies->status((uint64)wParam, (int)((uint64)lParam & 0xffffffff),
                          (unsigned int)((uint64)lParam >> 32), GetTickCount64());
-        if ((int)((uint64)lParam & 0xffffffff) == STATUS_CONNECTION_ESTABLISHED)
+        if (g_talkSession)
+            g_talkSession->status((uint64)wParam, (int)((uint64)lParam & 0xffffffff),
+                                 (unsigned int)((uint64)lParam >> 32), GetTickCount64());
+        if ((int)((uint64)lParam & 0xffffffff) == STATUS_CONNECTION_ESTABLISHED) {
             g_copyTabs.restoreIfSelected((uint64)wParam);
+            g_talkTabs.restoreIfSelected((uint64)wParam);
+        }
         return 0;
     }
     return DefWindowProcA(window, message, wParam, lParam);
@@ -169,7 +199,14 @@ static bool ensureCopyQueue() {
     hooks.closeTab = copyCloseTab;
     g_copies = new Copies::Manager(ts3Functions, hooks);
     g_copyWindow = CreateWindowExA(0, COPY_WINDOW_CLASS, "", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
-    if (g_copyWindow && SetTimer(g_copyWindow, 1, 50, NULL)) return true;
+    if (g_copyWindow && SetTimer(g_copyWindow, 1, 50, NULL) && SetTimer(g_copyWindow, 2, 20, NULL)) {
+        Copies::Hooks talkHooks;
+        talkHooks.ownership = talkOwnership; talkHooks.opening = copyOpening;
+        talkHooks.beforeOpen = talkBeforeOpen; talkHooks.afterOpen = talkAfterOpen;
+        talkHooks.closeTab = talkCloseTab;
+        g_talkSession = new TalkBack::Session(ts3Functions, g_talkAudio, talkHooks, pluginID);
+        return true;
+    }
     if (g_copyWindow) DestroyWindow(g_copyWindow);
     g_copyWindow = NULL;
     delete g_copies; g_copies = NULL;
@@ -228,6 +265,7 @@ static void setDefaults() {
     g.talkDelayMs      = 1000;   /* 1s so the victim gets a word out first */
     g.selfLockOn       = 0;
     g.copyCount        = 5;
+    g.talkBack         = TalkBack::Options();
     strcpy(g.customMsg, "stop ignoring me!");
     g.talkPokeMsg[0]   = '\0';   /* blank = fall back to poke settings */
     g.randomMsgs.clear();
@@ -269,6 +307,10 @@ static void loadSettings() {
     char copyCount[32];
     GetPrivateProfileStringA("copies", "count", "5", copyCount, sizeof(copyCount), ini);
     Copies::parseCount(copyCount, g.copyCount);
+    TalkBack::Options talkBack;
+    talkBack.semitones = GetPrivateProfileIntA("talkback", "semitones", talkBack.semitones, ini);
+    talkBack.volume = GetPrivateProfileIntA("talkback", "volume", talkBack.volume, ini);
+    if (talkBack.valid()) g.talkBack = talkBack;
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
     GetPrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, g.talkPokeMsg, sizeof(g.talkPokeMsg), ini);
 
@@ -324,6 +366,10 @@ static void saveSettings() {
     WritePrivateProfileStringA("selflock", "on", num, ini);
     _snprintf(num, sizeof(num), "%d", g.copyCount);
     WritePrivateProfileStringA("copies", "count", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.talkBack.semitones);
+    WritePrivateProfileStringA("talkback", "semitones", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.talkBack.volume);
+    WritePrivateProfileStringA("talkback", "volume", num, ini);
 
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
     WritePrivateProfileStringA("poke", "randomCount", num, ini);
@@ -759,6 +805,7 @@ static void stopAllJobs() {
  * Auto-poke-back is turned off for the session (re-enable it in Settings);
  * all talk-poke arming is cleared. */
 static void hardStop() {
+    stopTalkBack();
     if (g_copies) g_copies->stopAll();
     stopAllJobs();
     EnterCriticalSection(&cs);
@@ -768,7 +815,7 @@ static void hardStop() {
     LeaveCriticalSection(&cs);
     ts3Functions.printMessageToCurrentTab(
         "[Fun Plugin] HARD STOP: copy queue cancelled and copies disconnected; all jobs stopped, "
-        "talk-poke/talk-move disarmed, auto-poke-back turned off.");
+        "Talk Back stopped, talk-poke/talk-move disarmed, auto-poke-back turned off.");
 }
 
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
@@ -1162,7 +1209,7 @@ static void openCopies(uint64 sch, uint64 channel) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not initialize the copy queue.");
         return;
     }
-    if (g_copies->busy()) {
+    if (g_copies->busy() || (g_talkSession && g_talkSession->connecting())) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] A copy queue is already running. Remove my copies cancels it.");
         return;
     }
@@ -1207,6 +1254,77 @@ static void openCopies(uint64 sch, uint64 channel) {
     } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start the copy queue. Check your original connection.");
 }
 
+struct TalkBackDialog { TalkBack::Options options; std::wstring name; };
+static INT_PTR CALLBACK talkBackProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    TalkBackDialog* data = (TalkBackDialog*)GetWindowLongPtrW(dialog, DWLP_USER);
+    if (message == WM_INITDIALOG) {
+        data = (TalkBackDialog*)lParam;
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        SetDlgItemTextW(dialog, IDC_TB_TARGET, data->name.c_str());
+        CheckRadioButton(dialog, IDC_TB_DOWN, IDC_TB_UP, data->options.semitones < 0 ? IDC_TB_DOWN : IDC_TB_UP);
+        setDlgInt(dialog, IDC_TB_STRENGTH, abs(data->options.semitones));
+        setDlgInt(dialog, IDC_TB_VOLUME, data->options.volume);
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDOK && data) {
+        TalkBack::Options selected;
+        selected.semitones = (int)GetDlgItemInt(dialog, IDC_TB_STRENGTH, NULL, FALSE);
+        if (IsDlgButtonChecked(dialog, IDC_TB_DOWN) == BST_CHECKED) selected.semitones = -selected.semitones;
+        selected.volume = (int)GetDlgItemInt(dialog, IDC_TB_VOLUME, NULL, FALSE);
+        if (!selected.valid()) {
+            MessageBoxW(dialog, L"Use 1-12 semitones and a volume of 10-100%.",
+                        L"Talk Back", MB_OK | MB_ICONINFORMATION);
+            return TRUE;
+        }
+        data->options = selected;
+        EndDialog(dialog, IDOK);
+        return TRUE;
+    }
+    if ((message == WM_COMMAND && LOWORD(wParam) == IDCANCEL) || message == WM_CLOSE) {
+        EndDialog(dialog, IDCANCEL); return TRUE;
+    }
+    return FALSE;
+}
+
+static void openTalkBack(uint64 sch, anyID client) {
+    if (isCopyConnection(sch) || !g_talkTabs.available() || !ensureCopyQueue()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Start Talk Back from your original connected server tab."); return;
+    }
+    if (g_copies->busy() || g_talkSession->active() || g_talkSession->cleaning()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Wait for copy joining/cleanup to finish, or stop the current Talk Back first."); return;
+    }
+    int status = STATUS_DISCONNECTED; anyID me = 0; uint64 channel = 0, targetChannel = 0;
+    if (!client || ts3Functions.getConnectionStatus(sch, &status) != ERROR_ok || status != STATUS_CONNECTION_ESTABLISHED ||
+        ts3Functions.getClientID(sch, &me) != ERROR_ok || client == me ||
+        ts3Functions.getChannelOfClient(sch, me, &channel) != ERROR_ok ||
+        ts3Functions.getChannelOfClient(sch, client, &targetChannel) != ERROR_ok || targetChannel != channel) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Choose another person in your current channel for Talk Back."); return;
+    }
+    char* identity = nullptr;
+    if (ts3Functions.getClientVariableAsString(sch, client, CLIENT_UNIQUE_IDENTIFIER, &identity) != ERROR_ok || !identity) return;
+    std::string uid = identity; ts3Functions.freeMemory(identity);
+    Copies::Request request; request.source = sch; request.channel = channel;
+    char host[1024] = {}, password[1024] = {}, path[1024] = {}, channelPassword[1024] = {};
+    unsigned short port = 0;
+    if (ts3Functions.getServerConnectInfo(sch, host, &port, password, sizeof(host)) != ERROR_ok || !host[0] || !port) return;
+    request.address = host;
+    if (request.address.find(':') != std::string::npos && request.address[0] != '[') request.address = "[" + request.address + "]";
+    request.address += ":" + std::to_string(port); request.serverPassword = password;
+    if (ts3Functions.getChannelConnectInfo(sch, channel, path, channelPassword, sizeof(path)) == ERROR_ok) {
+        request.channelPath = path; request.channelPassword = channelPassword;
+    }
+    if (request.channelPath.empty()) request.channelPath = channelPathOf(sch, channel);
+    TalkBackDialog data; data.options = g.talkBack;
+    char name[512] = {};
+    if (ts3Functions.getClientDisplayName && ts3Functions.getClientDisplayName(sch, client, name, sizeof(name)) == ERROR_ok)
+        data.name = copyWide(name);
+    if (data.name.empty()) data.name = L"Selected user";
+    if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_TALKBACK), GetForegroundWindow(), talkBackProc, (LPARAM)&data) != IDOK) return;
+    if (g_talkSession->start(request, client, uid, data.options, GetTickCount64())) {
+        g.talkBack = data.options; saveSettings();
+    } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start Talk Back. Check your connection and plugin registration.");
+}
+
 /* ------------------------------------------------------------------ */
 /* Menu creation helper                                               */
 /* ------------------------------------------------------------------ */
@@ -1245,12 +1363,18 @@ int ts3plugin_init() {
 
 void ts3plugin_shutdown() {
     InterlockedExchange(&selfLock, 0);
+    g_talkAudio.stop();
     if (g_copyWindow) {
         KillTimer(g_copyWindow, 1);
+        KillTimer(g_copyWindow, 2);
         MSG queued;
         while (PeekMessageA(&queued, g_copyWindow, WM_COPY_STATUS, WM_COPY_STATUS, PM_REMOVE)) {}
         DestroyWindow(g_copyWindow);
         g_copyWindow = NULL;
+    }
+    if (g_talkSession) {
+        g_talkSession->shutdown();
+        delete g_talkSession; g_talkSession = NULL;
     }
     if (g_copies) {
         g_copies->shutdown();
@@ -1303,7 +1427,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 20;
+    const int count = 23;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -1317,6 +1441,8 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_STOP,  "Talk-poke: Disarm");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKMOVE_START, "Talk-move: Arm");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKMOVE_STOP,  "Talk-move: Disarm");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKBACK_START, "Talk Back: Start...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKBACK_STOP,  "Talk Back: Stop");
     /* Right-click a CHANNEL -> everyone in it */
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_MOVE_START_CH,  "Random Move: Start (everyone here)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke: Start (everyone here)");
@@ -1329,6 +1455,7 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SELFLOCK_OFF,   "Self-lock: OFF");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES,         "Make copies of myself...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES_REMOVE,  "Remove my copies (cancel queue)");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_TALKBACK_STOP_ALL, "Talk Back: Stop");
     (*menuItems)[n++] = NULL;
 
     *menuIcon = NULL;
@@ -1413,6 +1540,16 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         break;
 
     /* ---- global ---- */
+    case MENU_TALKBACK_START:
+        if (type == PLUGIN_MENU_TYPE_CLIENT) openTalkBack(serverConnectionHandlerID, clientTarget);
+        break;
+    case MENU_TALKBACK_STOP:
+        if (g_talkSession && g_talkSession->sourceConnection() == serverConnectionHandlerID &&
+            g_talkSession->targetClient() == clientTarget) stopTalkBack();
+        break;
+    case MENU_TALKBACK_STOP_ALL:
+        stopTalkBack();
+        break;
     case MENU_COPIES:
         openCopies(serverConnectionHandlerID, 0);
         break;
@@ -1524,12 +1661,42 @@ void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int sta
     if (any) scheduleReaction(d);
 }
 
+void ts3plugin_onEditPlaybackVoiceDataEvent(uint64 sch, anyID client, short* samples, int count, int channels) {
+    g_talkAudio.receive(sch, client, samples, count, channels);
+}
+
+void ts3plugin_onEditCapturedVoiceDataEvent(uint64 sch, short* samples, int count, int channels, int* edited) {
+    if (sch != g_talkAudio.helper.load() || !edited || !samples || count <= 0 || channels <= 0) return;
+    if (g_talkAudio.transmit.load() && !g_talkAudio.cancelled.load()) *edited |= 3;
+    else {
+        std::fill(samples, samples + (size_t)count * channels, (short)0);
+        *edited = (*edited | 1) & ~2;
+    }
+}
+
+int ts3plugin_onServerErrorEvent(uint64 sch, const char* message, unsigned int error, const char* code, const char* extra) {
+    (void)message; (void)extra;
+    return g_talkAudio.serverReply(sch, code, error) ? 1 : 0;
+}
+
+int ts3plugin_onServerPermissionErrorEvent(uint64 sch, const char* message, unsigned int error, const char* code, unsigned int permission) {
+    (void)message; (void)permission;
+    return g_talkAudio.serverReply(sch, code, error) ? 1 : 0;
+}
+
+void ts3plugin_onClientMoveTimeoutEvent(uint64 sch, anyID client, uint64 oldChannel, uint64 newChannel,
+                                      int visibility, const char* message) {
+    (void)oldChannel; (void)newChannel; (void)visibility; (void)message;
+    g_talkAudio.departed(sch, client);
+}
+
 /* ---- Self-lock: react to my own client being moved/kicked ---- */
 
 void ts3plugin_onClientMoveEvent(uint64 serverConnectionHandlerID, anyID clientID,
                                  uint64 oldChannelID, uint64 newChannelID,
                                  int visibility, const char* moveMessage) {
     (void)oldChannelID; (void)visibility; (void)moveMessage;
+    if (oldChannelID != newChannelID) g_talkAudio.departed(serverConnectionHandlerID, clientID);
     /* a plain move event is a voluntary/self switch -> re-anchor */
     selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID, false);
 }
@@ -1540,6 +1707,7 @@ void ts3plugin_onClientMoveMovedEvent(uint64 serverConnectionHandlerID, anyID cl
                                       const char* moverUniqueIdentifier, const char* moveMessage) {
     (void)oldChannelID; (void)visibility; (void)moverName;
     (void)moverUniqueIdentifier; (void)moveMessage;
+    if (oldChannelID != newChannelID) g_talkAudio.departed(serverConnectionHandlerID, clientID);
     selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID,
                      moverID != ownClient(serverConnectionHandlerID));
 }
@@ -1550,6 +1718,7 @@ void ts3plugin_onClientKickFromChannelEvent(uint64 serverConnectionHandlerID, an
                                             const char* kickerUniqueIdentifier, const char* kickMessage) {
     (void)oldChannelID; (void)visibility; (void)kickerName;
     (void)kickerUniqueIdentifier; (void)kickMessage;
+    g_talkAudio.departed(serverConnectionHandlerID, clientID);
     selfMovedHandler(serverConnectionHandlerID, clientID, newChannelID,
                      kickerID != ownClient(serverConnectionHandlerID));
 }
@@ -1561,6 +1730,7 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
                                            const char* kickerUniqueIdentifier, const char* kickMessage) {
     (void)oldChannelID; (void)newChannelID; (void)visibility;
     (void)kickerName; (void)kickerUniqueIdentifier; (void)kickMessage; (void)kickerID;
+    g_talkAudio.departed(serverConnectionHandlerID, clientID);
     if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening || serverConnectionHandlerID != selfLockSch) return;
     anyID meNow = ownClient(serverConnectionHandlerID);
     if (!selfLock) return;
@@ -1576,6 +1746,7 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
  * (set by onClientKickFromServerEvent) to tell them apart. */
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus,
                                           unsigned int errorNumber) {
+    if (newStatus == STATUS_DISCONNECTED) g_talkAudio.disconnected(serverConnectionHandlerID);
     if (g_copyWindow)
         PostMessageA(g_copyWindow, WM_COPY_STATUS, (WPARAM)serverConnectionHandlerID,
                      (LPARAM)(((uint64)errorNumber << 32) | (unsigned int)newStatus));

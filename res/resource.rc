@@ -64,6 +64,24 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 240, 405, 50, 14
 END
 
+IDD_TALKBACK DIALOGEX 0, 0, 300, 164
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Fun Plugin - Talk Back"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Whisper back to:", -1, 12, 12, 70, 10
+    LTEXT           "", IDC_TB_TARGET, 86, 12, 200, 18, SS_NOPREFIX
+    AUTORADIOBUTTON "Pitch down (deep)", IDC_TB_DOWN, 12, 38, 125, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Pitch up (high)", IDC_TB_UP, 155, 38, 125, 10
+    LTEXT           "Pitch amount (1-12 semitones):", -1, 12, 59, 170, 10
+    EDITTEXT        IDC_TB_STRENGTH, 200, 57, 50, 14, ES_NUMBER | WS_TABSTOP
+    LTEXT           "Echo volume (10-100%):", -1, 12, 81, 170, 10
+    EDITTEXT        IDC_TB_VOLUME, 200, 79, 50, 14, ES_NUMBER | WS_TABSTOP
+    LTEXT           "Live pitched whisper while they speak.\nYour microphone pauses until Talk Back is stopped.\nUses one Talk Back tab. No phrase recording.", -1, 12, 103, 274, 30
+    DEFPUSHBUTTON   "Start Talk Back", IDOK, 145, 140, 80, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 231, 140, 55, 14
+END
+
 IDD_COPIES DIALOGEX 0, 0, 300, 164
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Fun Plugin - Make copies of myself"

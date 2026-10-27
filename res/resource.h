@@ -8,6 +8,12 @@
 #define IDC_COPY_NICKNAME   1201
 #define IDC_COPY_PASSWORD   1202
 #define IDC_COPY_CHANNEL    1203
+#define IDD_TALKBACK        102
+#define IDC_TB_TARGET       1210
+#define IDC_TB_DOWN         1211
+#define IDC_TB_UP           1212
+#define IDC_TB_STRENGTH     1213
+#define IDC_TB_VOLUME       1215
 
 /* Move settings */
 #define IDC_MOVE_INTERVAL   1001  /* edit: seconds between moves          */

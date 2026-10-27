@@ -49,6 +49,7 @@ struct Request {
     uint64 source = 0, channel = 0;
     int count = 0;
     std::string address, serverPassword, channelPath, channelPassword, baseNickname;
+    std::string tabLabel = "Fun Plugin copy";
 };
 
 struct Hooks {
@@ -287,7 +288,7 @@ public:
         uint64 sch = 0;
         std::string nick = nickname(batch.baseNickname, ++serial);
         if (hooks.opening) hooks.opening(true);
-        err = api.guiConnect(PLUGIN_CONNECT_TAB_NEW, "Fun Plugin copy", batch.address.c_str(),
+        err = api.guiConnect(PLUGIN_CONNECT_TAB_NEW, batch.tabLabel.c_str(), batch.address.c_str(),
                              batch.serverPassword.c_str(), nick.c_str(), batch.channelPath.c_str(),
                              batch.channelPassword.c_str(), noAudioProfile(), noAudioProfile(),
                              "", "", "", "", "", &sch);

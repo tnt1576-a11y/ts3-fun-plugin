@@ -4,6 +4,7 @@ A client-side plugin for messing with friends on your own TS3 server.
 
 - **Random Move** — keep moving a chosen user into a random *empty* channel on a timer.
 - **Make copies of myself** — enter how many extra connections to join, in ordinary TS3 tabs.
+- **Talk Back** — stream a live pitched echo of a selected person's voice as a private whisper to them.
 - **Poke** — keep poking a chosen user with a custom or random message on a timer.
 - **HARD STOP** — one click halts everything.
 - **Settings** — native dialog for intervals and messages (saved to `funplugin.ini`).
@@ -69,6 +70,7 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 - **Talk-move: Arm / Disarm** — moves them to another channel every time they start
   talking (follows your "no empty channel" setting, but never prompts mid-talk — it
   just skips the move if there's nowhere to send them)
+- **Talk Back: Start... / Stop** — echo their voice as a live pitched whisper.
 
 **Right-click a CHANNEL** (group actions on everyone in it):
 - **Random Move / Poke / Chaos everyone here**
@@ -113,6 +115,30 @@ this feature.
 Automatic tab management requires TS3's Windows Qt 5.15 runtime and the supported
 server-tab widget. On an unsupported layout, the copy action reports that it cannot
 start. Tabs left over from previous plugin loads are not adopted by name.
+
+### Talk Back
+
+Right-click someone in your current channel and select **Talk Back: Start...**.
+Choose **Pitch down (deep)** or **Pitch up (high)**, an amount from 1 to 12 semitones,
+and a volume from 10 to 100%. Once connected, the effect processes their voice
+as it arrives and whispers the pitched echo back **only to that person**, while
+they are still speaking. It keeps the original speaking pace. You must be able
+to hear the speaker. There is no phrase recording or added replay delay; the
+short audio-processing buffer and the network still add some latency.
+
+Talk Back uses one extra **Talk Back** tab with a synthetic audio input. It uses
+your default TeamSpeak identity and needs a free server slot and permission to
+join and whisper. The recipient's settings must allow that identity's whispers.
+TeamSpeak's one-active-capture limit means your normal microphone pauses while
+Talk Back is enabled and returns when you stop it. Your mute/PTT settings and
+whisper list are left as you set them. Small audio buffers stay in memory;
+the effect does not create recordings or save voice files.
+
+Only one person can be selected at a time. **Talk Back: Stop**
+in the person's menu or the global plugin menu, and **HARD STOP**, cancel the effect,
+discard buffered audio, disconnect its helper, and close its tab. Leaving the channel,
+losing the connection, or a rejected whisper also stops it. Finish any copy batch
+before starting Talk Back; the copy feature keeps its existing joining speed.
 
 **Self-lock** protects *you*: while ON, if anyone force-moves or channel-kicks you out
 of your channel, you snap right back. It also covers **server kicks** — if someone kicks
