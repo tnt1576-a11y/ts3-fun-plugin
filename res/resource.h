@@ -3,6 +3,11 @@
 
 /* Dialog */
 #define IDD_SETTINGS        100
+#define IDD_COPIES          101
+#define IDC_COPY_COUNT      1200
+#define IDC_COPY_NICKNAME   1201
+#define IDC_COPY_PASSWORD   1202
+#define IDC_COPY_CHANNEL    1203
 
 /* Move settings */
 #define IDC_MOVE_INTERVAL   1001  /* edit: seconds between moves          */

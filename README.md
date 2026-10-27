@@ -3,6 +3,7 @@
 A client-side plugin for messing with friends on your own TS3 server.
 
 - **Random Move** — keep moving a chosen user into a random *empty* channel on a timer.
+- **Make copies of myself** — enter how many extra connections to join, in ordinary TS3 tabs.
 - **Poke** — keep poking a chosen user with a custom or random message on a timer.
 - **HARD STOP** — one click halts everything.
 - **Settings** — native dialog for intervals and messages (saved to `funplugin.ini`).
@@ -22,6 +23,15 @@ build.bat
 ```
 
 This produces `funplugin_win64.dll`.
+
+Run `test.bat` for the offline SDK integration tests. They use fake connections and
+an isolated temporary config directory; no server or real TeamSpeak settings are used.
+When TS3 is installed in `C:\Program Files\TeamSpeak 3 Client`, it also tests the tab
+bridge with that installation's Qt DLLs in a separate hidden test window, including
+focus restoration, deferred tab disposal, and both a directly named tab control and
+TeamSpeak's named-wrapper layout. It does not launch or connect TeamSpeak.
+After rebuilding and packaging, `python tests/package_smoke.py` loads the exact DLL
+from the installer and checks its version, lifecycle, menus, and native dialog resources.
 
 ## Install
 
@@ -62,9 +72,47 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 
 **Right-click a CHANNEL** (group actions on everyone in it):
 - **Random Move / Poke / Chaos everyone here**
+- **Make copies of myself here...** — choose the extra copy count and join this channel.
 
-**Global plugin menu:** **Settings...**, **HARD STOP - stop everything**, and
-**Self-lock: ON / OFF**.
+**Global plugin menu:** **Settings...**, **HARD STOP - stop everything**,
+**Self-lock: ON / OFF**, **Make copies of myself...**, and **Remove my copies (cancel queue)**.
+
+### Make copies of myself
+
+From your original connected tab, open **Plugins → Fun Plugin → Make copies of myself...**
+to join your current channel, or right-click another channel and select **Make copies
+of myself here...**. Enter the number of **extra** copies (5 means you plus 5 copies),
+adjust the nickname prefix if desired, and supply the channel password when needed.
+
+Copies appear as `YourName #1`, `YourName #2`, etc. Long and Unicode names are shortened
+to fit TeamSpeak's nickname limit without splitting UTF-8 characters. Copies use your
+**default TeamSpeak identity**, which can differ from the identity on your original tab.
+Copies connect with capture and playback set to None, so they do not open your
+microphone or speakers. Both are also muted. If TeamSpeak enables audio on a copy,
+the queue stops and disconnects pending copies.
+There is no microphone relay and no additional TeamSpeak process.
+
+The count is any positive 32-bit whole number, with no fixed five-copy cap. Copies
+connect one at a time, with a short settling pause after each connection establishes.
+Your selected tab is preserved throughout joining. The actual
+number is limited by server slots, channel capacity, identity clone limits and other
+server permissions. The queue stops on a rejection, wrong channel, timeout, or loss
+of the original connection, and reports how many copies joined. Successful copies
+remain connected until removed; there is no automatic retry or limit bypass.
+
+**Remove my copies (cancel queue)** cancels pending joins and disconnects all copies
+made by this plugin session, leaving your original and unrelated connections alone.
+Their tabs close automatically after disconnecting, through their normal close buttons.
+Cleanup handles two tabs per GUI tick and retries deferred closes. **HARD STOP** and
+unloading the plugin also remove those copies. Only tabs created during the current
+plugin session are tracked; tabs left over from an earlier load need closing once.
+Your original and unrelated tabs stay open. The count is remembered
+in `funplugin.ini`; copies never join automatically, and passwords are not saved by
+this feature.
+
+Automatic tab management requires TS3's Windows Qt 5.15 runtime and the supported
+server-tab widget. On an unsupported layout, the copy action reports that it cannot
+start. Tabs left over from previous plugin loads are not adopted by name.
 
 **Self-lock** protects *you*: while ON, if anyone force-moves or channel-kicks you out
 of your channel, you snap right back. It also covers **server kicks** — if someone kicks
@@ -78,8 +126,9 @@ OFF from the same menu. Session-only and unaffected by HARD STOP.
 Settings > Reactions) before firing, so the person gets a word out before it hits. Set
 it to 0 for instant.
 
-HARD STOP is the failsafe — it stops **all** activity: the move/poke/chaos jobs (however
-they were started), **disarms every talk-poke** target, and **turns off auto-poke-back**
+HARD STOP is the failsafe — it cancels copy joins and disconnects copies, stops
+the move/poke/chaos jobs (however they were started), **disarms every talk-poke**
+target, and **turns off auto-poke-back**
 for the session (re-enable it in Settings). The individual *Stop* items only stop their
 own job and leave the reactive features alone.
 

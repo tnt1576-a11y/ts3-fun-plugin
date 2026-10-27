@@ -63,3 +63,21 @@ BEGIN
     DEFPUSHBUTTON   "OK",     IDOK,     182, 405, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 240, 405, 50, 14
 END
+
+IDD_COPIES DIALOGEX 0, 0, 300, 164
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Fun Plugin - Make copies of myself"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Join channel:", -1, 12, 12, 60, 10
+    LTEXT           "", IDC_COPY_CHANNEL, 76, 12, 210, 20, SS_NOPREFIX
+    LTEXT           "Extra copies:", -1, 12, 38, 80, 10
+    EDITTEXT        IDC_COPY_COUNT, 100, 36, 65, 14, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Nickname prefix:", -1, 12, 60, 80, 10
+    EDITTEXT        IDC_COPY_NICKNAME, 100, 58, 186, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Channel password:", -1, 12, 82, 85, 10
+    EDITTEXT        IDC_COPY_PASSWORD, 100, 80, 186, 14, ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Copies join without microphone or playback. Server limits apply.\nRemove my copies disconnects them and closes their tabs.", -1, 12, 104, 274, 24
+    DEFPUSHBUTTON   "Join copies", IDOK, 160, 140, 65, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 231, 140, 55, 14
+END

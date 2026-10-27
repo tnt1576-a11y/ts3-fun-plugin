@@ -4,6 +4,7 @@ tools/
 # Build intermediates and the loose binary
 *.o
 /funplugin_win64.dll
+/tests/bin/
 
 # The packaged installer in dist/ IS committed on purpose:
 !dist/

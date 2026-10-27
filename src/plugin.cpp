@@ -31,6 +31,8 @@
 #include "plugin.h"
 
 #include "resource.h"
+#include "copies.h"
+#include "tab_ui.h"
 
 /* The SDK header declares ts3plugin_apiVersion() but does not define the number;
  * the demo plugin defines it itself. 26 matches modern TS3 clients (3.5/3.6). */
@@ -47,9 +49,9 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.3"
+#define PLUGIN_VERSION "2.10"
 #define PLUGIN_AUTHOR  "kingtnt"
-#define PLUGIN_DESC    "Random-move, poke and chaos your friends for fun."
+#define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
 /* Menu item ids */
 enum {
@@ -69,7 +71,10 @@ enum {
     MENU_SETTINGS,
     MENU_HARDSTOP,
     MENU_SELFLOCK_ON,     /* global: lock myself into my current channel */
-    MENU_SELFLOCK_OFF
+    MENU_SELFLOCK_OFF,
+    MENU_COPIES,
+    MENU_COPIES_CH,
+    MENU_COPIES_REMOVE
 };
 
 /* "No empty channel" behaviour */
@@ -96,6 +101,7 @@ struct Settings {
     int  talkPokeTimes;    /* pokes each time a watched user starts talking */
     int  talkDelayMs;      /* delay before a talk reaction fires; 0 = instant */
     int  selfLockOn;       /* 0/1: persisted; auto-arms self-lock on every connect */
+    int  copyCount;        /* remembered count; never auto-connect on startup */
     char customMsg[256];
     char talkPokeMsg[256]; /* dedicated talk-poke text; blank = use poke settings */
     std::vector<std::string> randomMsgs;
@@ -103,6 +109,73 @@ struct Settings {
 
 static Settings g;
 static CRITICAL_SECTION cs;   /* guards job start/stop + shared reaction state */
+
+static HWND g_copyWindow = NULL;
+static Copies::Manager* g_copies = NULL;   /* only accessed on the GUI thread */
+static CopyTabUI g_copyTabs;
+static std::set<uint64> g_copyHandlers;    /* callback filter, guarded by cs */
+static volatile LONG g_copyOpening = 0;
+static const UINT WM_COPY_STATUS = WM_APP + 61;
+static const char* COPY_WINDOW_CLASS = "FunPluginCopyQueue";
+
+static bool isCopyConnection(uint64 sch) {
+    EnterCriticalSection(&cs);
+    bool copy = g_copyHandlers.count(sch) != 0;
+    LeaveCriticalSection(&cs);
+    return copy;
+}
+
+static void copyOwnership(uint64 sch, bool owned) {
+    EnterCriticalSection(&cs);
+    if (owned) g_copyHandlers.insert(sch);
+    else g_copyHandlers.erase(sch);
+    LeaveCriticalSection(&cs);
+    if (!owned) g_copyTabs.forget(sch);
+}
+
+static void copyOpening(bool opening) { InterlockedExchange(&g_copyOpening, opening ? 1 : 0); }
+static bool copyBeforeOpen() { return g_copyTabs.begin(); }
+static bool copyAfterOpen(uint64 sch) { return g_copyTabs.end(sch); }
+static bool copyCloseTab(uint64 sch) { return g_copyTabs.close(sch); }
+
+static LRESULT CALLBACK copyWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_TIMER && g_copies) {
+        g_copies->tick(GetTickCount64());
+        return 0;
+    }
+    if (message == WM_COPY_STATUS && g_copies) {
+        g_copies->status((uint64)wParam, (int)((uint64)lParam & 0xffffffff),
+                         (unsigned int)((uint64)lParam >> 32), GetTickCount64());
+        if ((int)((uint64)lParam & 0xffffffff) == STATUS_CONNECTION_ESTABLISHED)
+            g_copyTabs.restoreIfSelected((uint64)wParam);
+        return 0;
+    }
+    return DefWindowProcA(window, message, wParam, lParam);
+}
+
+/* Create the timer on the menu's GUI thread, independent of the init thread. */
+static bool ensureCopyQueue() {
+    if (g_copyWindow) return true;
+    WNDCLASSA windowClass = {};
+    windowClass.lpfnWndProc = copyWindowProc;
+    windowClass.hInstance = hInstance;
+    windowClass.lpszClassName = COPY_WINDOW_CLASS;
+    if (!RegisterClassA(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+    Copies::Hooks hooks;
+    hooks.ownership = copyOwnership;
+    hooks.opening = copyOpening;
+    hooks.beforeOpen = copyBeforeOpen;
+    hooks.afterOpen = copyAfterOpen;
+    hooks.closeTab = copyCloseTab;
+    g_copies = new Copies::Manager(ts3Functions, hooks);
+    g_copyWindow = CreateWindowExA(0, COPY_WINDOW_CLASS, "", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    if (g_copyWindow && SetTimer(g_copyWindow, 1, 50, NULL)) return true;
+    if (g_copyWindow) DestroyWindow(g_copyWindow);
+    g_copyWindow = NULL;
+    delete g_copies; g_copies = NULL;
+    UnregisterClassA(COPY_WINDOW_CLASS, hInstance);
+    return false;
+}
 
 /* Reaction state (guarded by cs) */
 static std::set<anyID>          talkTargets;      /* users armed for talk-poke  */
@@ -154,6 +227,7 @@ static void setDefaults() {
     g.talkPokeTimes    = 1;
     g.talkDelayMs      = 1000;   /* 1s so the victim gets a word out first */
     g.selfLockOn       = 0;
+    g.copyCount        = 5;
     strcpy(g.customMsg, "stop ignoring me!");
     g.talkPokeMsg[0]   = '\0';   /* blank = fall back to poke settings */
     g.randomMsgs.clear();
@@ -192,6 +266,9 @@ static void loadSettings() {
     g.talkPokeTimes    = GetPrivateProfileIntA("react", "talkPokeTimes", g.talkPokeTimes, ini);
     g.talkDelayMs      = GetPrivateProfileIntA("react", "talkDelayMs",   g.talkDelayMs, ini);
     g.selfLockOn       = GetPrivateProfileIntA("selflock", "on",        g.selfLockOn, ini);
+    char copyCount[32];
+    GetPrivateProfileStringA("copies", "count", "5", copyCount, sizeof(copyCount), ini);
+    Copies::parseCount(copyCount, g.copyCount);
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
     GetPrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, g.talkPokeMsg, sizeof(g.talkPokeMsg), ini);
 
@@ -245,6 +322,8 @@ static void saveSettings() {
 
     _snprintf(num, sizeof(num), "%d", g.selfLockOn);
     WritePrivateProfileStringA("selflock", "on", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.copyCount);
+    WritePrivateProfileStringA("copies", "count", num, ini);
 
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
     WritePrivateProfileStringA("poke", "randomCount", num, ini);
@@ -680,6 +759,7 @@ static void stopAllJobs() {
  * Auto-poke-back is turned off for the session (re-enable it in Settings);
  * all talk-poke arming is cleared. */
 static void hardStop() {
+    if (g_copies) g_copies->stopAll();
     stopAllJobs();
     EnterCriticalSection(&cs);
     talkTargets.clear();      /* disarm every talk-poke target */
@@ -687,7 +767,8 @@ static void hardStop() {
     g.autoPokeBack = 0;       /* stop reacting to incoming pokes */
     LeaveCriticalSection(&cs);
     ts3Functions.printMessageToCurrentTab(
-        "[Fun Plugin] HARD STOP: all jobs stopped, talk-poke/talk-move disarmed, auto-poke-back turned off.");
+        "[Fun Plugin] HARD STOP: copy queue cancelled and copies disconnected; all jobs stopped, "
+        "talk-poke/talk-move disarmed, auto-poke-back turned off.");
 }
 
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
@@ -1016,6 +1097,116 @@ static void openSettings() {
                     GetForegroundWindow(), settingsProc, 0);
 }
 
+/* Copies are ordinary tabs in this client, never additional processes. */
+static std::wstring copyWide(const std::string& text) {
+    int length = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, NULL, 0);
+    if (!length) return L"";
+    std::vector<wchar_t> buffer(length);
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, buffer.data(), length);
+    return buffer.data();
+}
+
+static std::string copyField(HWND dialog, int control) {
+    int length = GetWindowTextLengthW(GetDlgItem(dialog, control));
+    std::vector<wchar_t> buffer(length + 1);
+    GetDlgItemTextW(dialog, control, buffer.data(), (int)buffer.size());
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, buffer.data(), length, NULL, 0, NULL, NULL);
+    std::string result(bytes, '\0');
+    if (bytes) WideCharToMultiByte(CP_UTF8, 0, buffer.data(), length, &result[0], bytes, NULL, NULL);
+    return result;
+}
+
+static INT_PTR CALLBACK copiesProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    Copies::Request* request = (Copies::Request*)GetWindowLongPtrW(dialog, DWLP_USER);
+    if (message == WM_INITDIALOG) {
+        request = (Copies::Request*)lParam;
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        setDlgInt(dialog, IDC_COPY_COUNT, g.copyCount);
+        SendDlgItemMessageW(dialog, IDC_COPY_COUNT, EM_SETLIMITTEXT, 10, 0);
+        SendDlgItemMessageW(dialog, IDC_COPY_NICKNAME, EM_SETLIMITTEXT, 128, 0);
+        SendDlgItemMessageW(dialog, IDC_COPY_PASSWORD, EM_SETLIMITTEXT, 256, 0);
+        SetDlgItemTextW(dialog, IDC_COPY_CHANNEL, copyWide(request->channelPath).c_str());
+        SetDlgItemTextW(dialog, IDC_COPY_NICKNAME, copyWide(request->baseNickname).c_str());
+        SetDlgItemTextW(dialog, IDC_COPY_PASSWORD, copyWide(request->channelPassword).c_str());
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDOK && request) {
+        if (!Copies::parseCount(copyField(dialog, IDC_COPY_COUNT).c_str(), request->count)) {
+            MessageBoxW(dialog, L"Enter a whole number from 1 to 2147483647.", L"Extra copies", MB_OK | MB_ICONINFORMATION);
+            SetFocus(GetDlgItem(dialog, IDC_COPY_COUNT));
+            return TRUE;
+        }
+        request->baseNickname = copyField(dialog, IDC_COPY_NICKNAME);
+        if (request->baseNickname.find_first_not_of(" \t\r\n") == std::string::npos) {
+            MessageBoxW(dialog, L"Enter a nickname prefix for the copies.", L"Nickname", MB_OK | MB_ICONINFORMATION);
+            return TRUE;
+        }
+        request->channelPassword = copyField(dialog, IDC_COPY_PASSWORD);
+        EndDialog(dialog, IDOK);
+        return TRUE;
+    }
+    if ((message == WM_COMMAND && LOWORD(wParam) == IDCANCEL) || message == WM_CLOSE) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void openCopies(uint64 sch, uint64 channel) {
+    if (!g_copyTabs.available()) {
+        std::string message = std::string("[Fun Plugin] Copy tab setup failed: ") + g_copyTabs.failureReason();
+        ts3Functions.printMessageToCurrentTab(message.c_str());
+        return;
+    }
+    if (!ensureCopyQueue()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not initialize the copy queue.");
+        return;
+    }
+    if (g_copies->busy()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] A copy queue is already running. Remove my copies cancels it.");
+        return;
+    }
+    int status = STATUS_DISCONNECTED;
+    if (isCopyConnection(sch) || ts3Functions.getConnectionStatus(sch, &status) != ERROR_ok ||
+        status != STATUS_CONNECTION_ESTABLISHED) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Start copies from your original connected server tab.");
+        return;
+    }
+    Copies::Request request;
+    request.source = sch;
+    if (!channel) ts3Functions.getChannelOfClient(sch, ownClient(sch), &channel);
+    if (!channel) return;
+    request.channel = channel;
+    char host[1024] = {}, password[1024] = {}, path[1024] = {}, channelPassword[1024] = {};
+    unsigned short port = 0;
+    if (ts3Functions.getServerConnectInfo(sch, host, &port, password, sizeof(host)) != ERROR_ok || !host[0] || !port) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Cannot read this server's connection details.");
+        return;
+    }
+    request.address = host;
+    if (request.address.find(':') != std::string::npos && request.address[0] != '[')
+        request.address = "[" + request.address + "]";
+    request.address += ":" + std::to_string(port);
+    request.serverPassword = password;
+    if (ts3Functions.getChannelConnectInfo(sch, channel, path, channelPassword, sizeof(path)) == ERROR_ok) {
+        request.channelPath = path;
+        request.channelPassword = channelPassword;
+    }
+    if (request.channelPath.empty()) request.channelPath = channelPathOf(sch, channel);
+    char* nickname = NULL;
+    if (ts3Functions.getClientSelfVariableAsString(sch, CLIENT_NICKNAME, &nickname) == ERROR_ok && nickname) {
+        request.baseNickname = nickname;
+        ts3Functions.freeMemory(nickname);
+    }
+    if (request.baseNickname.empty()) request.baseNickname = "Copy";
+    if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_COPIES), GetForegroundWindow(),
+                        copiesProc, (LPARAM)&request) != IDOK) return;
+    if (g_copies->start(request, GetTickCount64())) {
+        g.copyCount = request.count;
+        saveSettings();
+    } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start the copy queue. Check your original connection.");
+}
+
 /* ------------------------------------------------------------------ */
 /* Menu creation helper                                               */
 /* ------------------------------------------------------------------ */
@@ -1054,6 +1245,19 @@ int ts3plugin_init() {
 
 void ts3plugin_shutdown() {
     InterlockedExchange(&selfLock, 0);
+    if (g_copyWindow) {
+        KillTimer(g_copyWindow, 1);
+        MSG queued;
+        while (PeekMessageA(&queued, g_copyWindow, WM_COPY_STATUS, WM_COPY_STATUS, PM_REMOVE)) {}
+        DestroyWindow(g_copyWindow);
+        g_copyWindow = NULL;
+    }
+    if (g_copies) {
+        g_copies->shutdown();
+        delete g_copies;
+        g_copies = NULL;
+    }
+    UnregisterClassA(COPY_WINDOW_CLASS, hInstance);
 
     /* cancel and drain any pending delayed reactions before we lose ts3Functions */
     if (g_shutdownEvent) SetEvent(g_shutdownEvent);
@@ -1099,7 +1303,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 17;
+    const int count = 20;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -1117,11 +1321,14 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_MOVE_START_CH,  "Random Move: Start (everyone here)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke: Start (everyone here)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_CHAOS_START_CH, "Chaos (move + poke): Start (everyone here)");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_COPIES_CH,     "Make copies of myself here...");
     /* Global plugin menu */
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SETTINGS,       "Settings...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_HARDSTOP,       "HARD STOP - stop everything");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SELFLOCK_ON,    "Self-lock: ON (can't be moved out)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SELFLOCK_OFF,   "Self-lock: OFF");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES,         "Make copies of myself...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES_REMOVE,  "Remove my copies (cancel queue)");
     (*menuItems)[n++] = NULL;
 
     *menuIcon = NULL;
@@ -1206,6 +1413,16 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         break;
 
     /* ---- global ---- */
+    case MENU_COPIES:
+        openCopies(serverConnectionHandlerID, 0);
+        break;
+    case MENU_COPIES_CH:
+        if (type == PLUGIN_MENU_TYPE_CHANNEL) openCopies(serverConnectionHandlerID, channelTarget);
+        break;
+    case MENU_COPIES_REMOVE:
+        if (g_copies) g_copies->stopAll();
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Copy queue cancelled; disconnecting plugin-created copies.");
+        break;
     case MENU_SETTINGS:
         openSettings();
         break;
@@ -1246,6 +1463,7 @@ int ts3plugin_onClientPokeEvent(uint64 serverConnectionHandlerID, anyID fromClie
                                 const char* pokerName, const char* pokerUniqueIdentity,
                                 const char* message, int ffIgnored) {
     (void)pokerName; (void)pokerUniqueIdentity; (void)message; (void)ffIgnored;
+    if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening) return 0;
 
     if (g.autoPokeBack) {
         DWORD now = GetTickCount();
@@ -1266,6 +1484,7 @@ int ts3plugin_onClientPokeEvent(uint64 serverConnectionHandlerID, anyID fromClie
 void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int status,
                                        int isReceivedWhisper, anyID clientID) {
     (void)isReceivedWhisper;
+    if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening) return;
     if (status != STATUS_TALKING) return;
 
     DelayedReaction d = {};
@@ -1342,6 +1561,7 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
                                            const char* kickerUniqueIdentifier, const char* kickMessage) {
     (void)oldChannelID; (void)newChannelID; (void)visibility;
     (void)kickerName; (void)kickerUniqueIdentifier; (void)kickMessage; (void)kickerID;
+    if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening || serverConnectionHandlerID != selfLockSch) return;
     anyID meNow = ownClient(serverConnectionHandlerID);
     if (!selfLock) return;
     if (clientID == (anyID)g_myId || clientID == meNow) {
@@ -1356,6 +1576,10 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
  * (set by onClientKickFromServerEvent) to tell them apart. */
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus,
                                           unsigned int errorNumber) {
+    if (g_copyWindow)
+        PostMessageA(g_copyWindow, WM_COPY_STATUS, (WPARAM)serverConnectionHandlerID,
+                     (LPARAM)(((uint64)errorNumber << 32) | (unsigned int)newStatus));
+    if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening) return;
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
         InterlockedExchange(&g_rejoinAttempts, 0);
         if (g.selfLockOn) {
@@ -1373,6 +1597,7 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     }
 
     if (newStatus != STATUS_DISCONNECTED) return;
+    if (serverConnectionHandlerID != selfLockSch) return;
 
     bool kicked = (InterlockedExchange(&g_kickFlag, 0) == 1);
     if (!selfLock) return;
