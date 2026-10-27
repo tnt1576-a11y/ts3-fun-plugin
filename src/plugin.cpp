@@ -50,7 +50,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.12"
+#define PLUGIN_VERSION "2.13"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
@@ -118,7 +118,6 @@ static CRITICAL_SECTION cs;   /* guards job start/stop + shared reaction state *
 static HWND g_copyWindow = NULL;
 static Copies::Manager* g_copies = NULL;   /* only accessed on the GUI thread */
 static CopyTabUI g_copyTabs;
-static CopyTabUI g_talkTabs;
 static TalkBack::Audio g_talkAudio;
 static TalkBack::Session* g_talkSession = NULL;
 static std::set<uint64> g_copyHandlers;    /* callback filter, guarded by cs */
@@ -145,17 +144,6 @@ static void copyOpening(bool opening) { InterlockedExchange(&g_copyOpening, open
 static bool copyBeforeOpen() { return g_copyTabs.begin(); }
 static bool copyAfterOpen(uint64 sch) { return g_copyTabs.end(sch); }
 static bool copyCloseTab(uint64 sch) { return g_copyTabs.close(sch); }
-static bool talkBeforeOpen() { return g_talkTabs.begin(); }
-static bool talkAfterOpen(uint64 sch) { return g_talkTabs.end(sch); }
-static bool talkCloseTab(uint64 sch) { return g_talkTabs.close(sch); }
-static void talkOwnership(uint64 sch, bool owned) {
-    copyOwnership(sch, owned);
-    if (owned) g_talkAudio.helper.store(sch);
-    else {
-        if (g_talkAudio.helper.load() == sch) g_talkAudio.helper.store(0);
-        g_talkTabs.forget(sch);
-    }
-}
 static void stopTalkBack() { if (g_talkSession) g_talkSession->stop(); }
 
 static LRESULT CALLBACK copyWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -163,20 +151,16 @@ static LRESULT CALLBACK copyWindowProc(HWND window, UINT message, WPARAM wParam,
         static bool ticking = false;
         if (ticking) return 0;
         ticking = true;
-        if (wParam == 1) g_copies->tick(GetTickCount64());
-        if (wParam == 2 && g_talkSession) g_talkSession->tick(GetTickCount64());
+        g_copies->tick(GetTickCount64());
+        if (g_talkSession) g_talkSession->tick(GetTickCount64());
         ticking = false;
         return 0;
     }
     if (message == WM_COPY_STATUS && g_copies) {
         g_copies->status((uint64)wParam, (int)((uint64)lParam & 0xffffffff),
                          (unsigned int)((uint64)lParam >> 32), GetTickCount64());
-        if (g_talkSession)
-            g_talkSession->status((uint64)wParam, (int)((uint64)lParam & 0xffffffff),
-                                 (unsigned int)((uint64)lParam >> 32), GetTickCount64());
         if ((int)((uint64)lParam & 0xffffffff) == STATUS_CONNECTION_ESTABLISHED) {
             g_copyTabs.restoreIfSelected((uint64)wParam);
-            g_talkTabs.restoreIfSelected((uint64)wParam);
         }
         return 0;
     }
@@ -199,12 +183,8 @@ static bool ensureCopyQueue() {
     hooks.closeTab = copyCloseTab;
     g_copies = new Copies::Manager(ts3Functions, hooks);
     g_copyWindow = CreateWindowExA(0, COPY_WINDOW_CLASS, "", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
-    if (g_copyWindow && SetTimer(g_copyWindow, 1, 50, NULL) && SetTimer(g_copyWindow, 2, 20, NULL)) {
-        Copies::Hooks talkHooks;
-        talkHooks.ownership = talkOwnership; talkHooks.opening = copyOpening;
-        talkHooks.beforeOpen = talkBeforeOpen; talkHooks.afterOpen = talkAfterOpen;
-        talkHooks.closeTab = talkCloseTab;
-        g_talkSession = new TalkBack::Session(ts3Functions, g_talkAudio, talkHooks, pluginID);
+    if (g_copyWindow && SetTimer(g_copyWindow, 1, 50, NULL)) {
+        g_talkSession = new TalkBack::Session(ts3Functions, g_talkAudio, pluginID);
         return true;
     }
     if (g_copyWindow) DestroyWindow(g_copyWindow);
@@ -1209,7 +1189,7 @@ static void openCopies(uint64 sch, uint64 channel) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not initialize the copy queue.");
         return;
     }
-    if (g_copies->busy() || (g_talkSession && g_talkSession->connecting())) {
+    if (g_copies->busy()) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] A copy queue is already running. Remove my copies cancels it.");
         return;
     }
@@ -1287,11 +1267,11 @@ static INT_PTR CALLBACK talkBackProc(HWND dialog, UINT message, WPARAM wParam, L
 }
 
 static void openTalkBack(uint64 sch, anyID client) {
-    if (isCopyConnection(sch) || !g_talkTabs.available() || !ensureCopyQueue()) {
+    if (isCopyConnection(sch) || !ensureCopyQueue()) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Start Talk Back from your original connected server tab."); return;
     }
-    if (g_copies->busy() || g_talkSession->active() || g_talkSession->cleaning()) {
-        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Wait for copy joining/cleanup to finish, or stop the current Talk Back first."); return;
+    if (g_talkSession->active()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Stop the current Talk Back before selecting another person."); return;
     }
     int status = STATUS_DISCONNECTED; anyID me = 0; uint64 channel = 0, targetChannel = 0;
     if (!client || ts3Functions.getConnectionStatus(sch, &status) != ERROR_ok || status != STATUS_CONNECTION_ESTABLISHED ||
@@ -1303,26 +1283,15 @@ static void openTalkBack(uint64 sch, anyID client) {
     char* identity = nullptr;
     if (ts3Functions.getClientVariableAsString(sch, client, CLIENT_UNIQUE_IDENTIFIER, &identity) != ERROR_ok || !identity) return;
     std::string uid = identity; ts3Functions.freeMemory(identity);
-    Copies::Request request; request.source = sch; request.channel = channel;
-    char host[1024] = {}, password[1024] = {}, path[1024] = {}, channelPassword[1024] = {};
-    unsigned short port = 0;
-    if (ts3Functions.getServerConnectInfo(sch, host, &port, password, sizeof(host)) != ERROR_ok || !host[0] || !port) return;
-    request.address = host;
-    if (request.address.find(':') != std::string::npos && request.address[0] != '[') request.address = "[" + request.address + "]";
-    request.address += ":" + std::to_string(port); request.serverPassword = password;
-    if (ts3Functions.getChannelConnectInfo(sch, channel, path, channelPassword, sizeof(path)) == ERROR_ok) {
-        request.channelPath = path; request.channelPassword = channelPassword;
-    }
-    if (request.channelPath.empty()) request.channelPath = channelPathOf(sch, channel);
     TalkBackDialog data; data.options = g.talkBack;
     char name[512] = {};
     if (ts3Functions.getClientDisplayName && ts3Functions.getClientDisplayName(sch, client, name, sizeof(name)) == ERROR_ok)
         data.name = copyWide(name);
     if (data.name.empty()) data.name = L"Selected user";
     if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_TALKBACK), GetForegroundWindow(), talkBackProc, (LPARAM)&data) != IDOK) return;
-    if (g_talkSession->start(request, client, uid, data.options, GetTickCount64())) {
+    if (g_talkSession->start(sch, client, uid, data.options, GetTickCount64())) {
         g.talkBack = data.options; saveSettings();
-    } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start Talk Back. Check your connection and plugin registration.");
+    } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start Talk Back. Activate your microphone, unmute playback, and release any whisper hotkey first.");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1363,10 +1332,9 @@ int ts3plugin_init() {
 
 void ts3plugin_shutdown() {
     InterlockedExchange(&selfLock, 0);
-    g_talkAudio.stop();
+    g_talkAudio.mute();
     if (g_copyWindow) {
         KillTimer(g_copyWindow, 1);
-        KillTimer(g_copyWindow, 2);
         MSG queued;
         while (PeekMessageA(&queued, g_copyWindow, WM_COPY_STATUS, WM_COPY_STATUS, PM_REMOVE)) {}
         DestroyWindow(g_copyWindow);
@@ -1376,6 +1344,7 @@ void ts3plugin_shutdown() {
         g_talkSession->shutdown();
         delete g_talkSession; g_talkSession = NULL;
     }
+    g_talkAudio.stop();
     if (g_copies) {
         g_copies->shutdown();
         delete g_copies;
@@ -1666,12 +1635,12 @@ void ts3plugin_onEditPlaybackVoiceDataEvent(uint64 sch, anyID client, short* sam
 }
 
 void ts3plugin_onEditCapturedVoiceDataEvent(uint64 sch, short* samples, int count, int channels, int* edited) {
-    if (sch != g_talkAudio.helper.load() || !edited || !samples || count <= 0 || channels <= 0) return;
-    if (g_talkAudio.transmit.load() && !g_talkAudio.cancelled.load()) *edited |= 3;
-    else {
-        std::fill(samples, samples + (size_t)count * channels, (short)0);
-        *edited = (*edited | 1) & ~2;
-    }
+    g_talkAudio.captured(sch, samples, count, channels, edited);
+}
+
+void ts3plugin_onClientSelfVariableUpdateEvent(uint64 sch, int flag, const char* oldValue, const char* newValue) {
+    (void)oldValue;
+    g_talkAudio.selfUpdate(sch, flag, newValue);
 }
 
 int ts3plugin_onServerErrorEvent(uint64 sch, const char* message, unsigned int error, const char* code, const char* extra) {

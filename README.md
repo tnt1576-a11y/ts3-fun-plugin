@@ -126,19 +126,21 @@ they are still speaking. It keeps the original speaking pace. You must be able
 to hear the speaker. There is no phrase recording or added replay delay; the
 short audio-processing buffer and the network still add some latency.
 
-Talk Back uses one extra **Talk Back** tab with a synthetic audio input. It uses
-your default TeamSpeak identity and needs a free server slot and permission to
-join and whisper. The recipient's settings must allow that identity's whispers.
-TeamSpeak's one-active-capture limit means your normal microphone pauses while
-Talk Back is enabled and returns when you stop it. Your mute/PTT settings and
-whisper list are left as you set them. Small audio buffers stay in memory;
-the effect does not create recordings or save voice files.
+Talk Back sends through **your existing user and microphone connection**. It
+creates no extra user or tab and needs permission to whisper to the recipient.
+Activate your microphone connection and unmute playback before starting it;
+release any active whisper hotkey first. While enabled, the effect replaces
+your microphone samples with the live echo, temporarily taking over mute,
+push-to-talk, voice activation, and the active whisper route. Your own voice
+is not mixed into the echo. Stop restores your original microphone settings
+and normal channel routing. Saved whisper presets are not edited. Small audio
+buffers stay in memory; the effect creates no recordings or voice files.
 
 Only one person can be selected at a time. **Talk Back: Stop**
 in the person's menu or the global plugin menu, and **HARD STOP**, cancel the effect,
-discard buffered audio, disconnect its helper, and close its tab. Leaving the channel,
-losing the connection, or a rejected whisper also stops it. Finish any copy batch
-before starting Talk Back; the copy feature keeps its existing joining speed.
+discard buffered audio and restore your microphone. Leaving the channel, losing
+the connection, a rejected whisper, or manually muting also stops it. The copy
+feature keeps its existing joining speed and tab cleanup.
 
 **Self-lock** protects *you*: while ON, if anyone force-moves or channel-kicks you out
 of your channel, you snap right back. It also covers **server kicks** — if someone kicks
