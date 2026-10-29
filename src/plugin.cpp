@@ -50,7 +50,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.13"
+#define PLUGIN_VERSION "2.14"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
@@ -78,7 +78,9 @@ enum {
     MENU_COPIES_REMOVE,
     MENU_TALKBACK_START,
     MENU_TALKBACK_STOP,
-    MENU_TALKBACK_STOP_ALL
+    MENU_TALKBACK_STOP_ALL,
+    MENU_TALKBACK_CHANNEL,
+    MENU_TALKBACK_CHANNEL_HERE
 };
 
 /* "No empty channel" behaviour */
@@ -1234,13 +1236,18 @@ static void openCopies(uint64 sch, uint64 channel) {
     } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start the copy queue. Check your original connection.");
 }
 
-struct TalkBackDialog { TalkBack::Options options; std::wstring name; };
+struct TalkBackDialog { TalkBack::Options options; std::wstring name; bool channel = false; };
 static INT_PTR CALLBACK talkBackProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
     TalkBackDialog* data = (TalkBackDialog*)GetWindowLongPtrW(dialog, DWLP_USER);
     if (message == WM_INITDIALOG) {
         data = (TalkBackDialog*)lParam;
         SetWindowLongPtrW(dialog, DWLP_USER, lParam);
         SetDlgItemTextW(dialog, IDC_TB_TARGET, data->name.c_str());
+        if (data->channel) {
+            SetWindowTextW(dialog, L"Fun Plugin - Channel Talk Back");
+            SetDlgItemTextW(dialog, IDC_TB_LABEL, L"Echo channel:");
+            SetDlgItemTextW(dialog, IDC_TB_HELP, L"Live pitched echo through your current user.\nEveryone in this channel hears it as normal voice.\nYour microphone is replaced by the echo until Stop.");
+        }
         CheckRadioButton(dialog, IDC_TB_DOWN, IDC_TB_UP, data->options.semitones < 0 ? IDC_TB_DOWN : IDC_TB_UP);
         setDlgInt(dialog, IDC_TB_STRENGTH, abs(data->options.semitones));
         setDlgInt(dialog, IDC_TB_VOLUME, data->options.volume);
@@ -1266,30 +1273,46 @@ static INT_PTR CALLBACK talkBackProc(HWND dialog, UINT message, WPARAM wParam, L
     return FALSE;
 }
 
-static void openTalkBack(uint64 sch, anyID client) {
+static void openTalkBack(uint64 sch, anyID client, bool channelMode = false, uint64 selectedChannel = 0) {
     if (isCopyConnection(sch) || !ensureCopyQueue()) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Start Talk Back from your original connected server tab."); return;
     }
     if (g_talkSession->active()) {
-        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Stop the current Talk Back before selecting another person."); return;
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Stop the current Talk Back before starting another mode."); return;
     }
     int status = STATUS_DISCONNECTED; anyID me = 0; uint64 channel = 0, targetChannel = 0;
-    if (!client || ts3Functions.getConnectionStatus(sch, &status) != ERROR_ok || status != STATUS_CONNECTION_ESTABLISHED ||
-        ts3Functions.getClientID(sch, &me) != ERROR_ok || client == me ||
-        ts3Functions.getChannelOfClient(sch, me, &channel) != ERROR_ok ||
-        ts3Functions.getChannelOfClient(sch, client, &targetChannel) != ERROR_ok || targetChannel != channel) {
+    if (ts3Functions.getConnectionStatus(sch, &status) != ERROR_ok || status != STATUS_CONNECTION_ESTABLISHED ||
+        ts3Functions.getClientID(sch, &me) != ERROR_ok || ts3Functions.getChannelOfClient(sch, me, &channel) != ERROR_ok) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Join a channel before starting Talk Back."); return;
+    }
+    if (channelMode && selectedChannel && selectedChannel != channel) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Channel Talk Back works in the channel you are currently in."); return;
+    }
+    if (!channelMode && (!client || client == me ||
+        ts3Functions.getChannelOfClient(sch, client, &targetChannel) != ERROR_ok || targetChannel != channel)) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Choose another person in your current channel for Talk Back."); return;
     }
-    char* identity = nullptr;
-    if (ts3Functions.getClientVariableAsString(sch, client, CLIENT_UNIQUE_IDENTIFIER, &identity) != ERROR_ok || !identity) return;
-    std::string uid = identity; ts3Functions.freeMemory(identity);
-    TalkBackDialog data; data.options = g.talkBack;
-    char name[512] = {};
-    if (ts3Functions.getClientDisplayName && ts3Functions.getClientDisplayName(sch, client, name, sizeof(name)) == ERROR_ok)
-        data.name = copyWide(name);
-    if (data.name.empty()) data.name = L"Selected user";
+    TalkBackDialog data; data.options = g.talkBack; data.channel = channelMode;
+    std::string uid;
+    if (channelMode) {
+        char* name = nullptr;
+        if (ts3Functions.getChannelVariableAsString(sch, channel, CHANNEL_NAME, &name) == ERROR_ok && name) {
+            data.name = copyWide(name); ts3Functions.freeMemory(name);
+        }
+        if (data.name.empty()) data.name = L"Your current channel";
+    } else {
+        char* identity = nullptr;
+        if (ts3Functions.getClientVariableAsString(sch, client, CLIENT_UNIQUE_IDENTIFIER, &identity) != ERROR_ok || !identity) return;
+        uid = identity; ts3Functions.freeMemory(identity);
+        char name[512] = {};
+        if (ts3Functions.getClientDisplayName && ts3Functions.getClientDisplayName(sch, client, name, sizeof(name)) == ERROR_ok)
+            data.name = copyWide(name);
+        if (data.name.empty()) data.name = L"Selected user";
+    }
     if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_TALKBACK), GetForegroundWindow(), talkBackProc, (LPARAM)&data) != IDOK) return;
-    if (g_talkSession->start(sch, client, uid, data.options, GetTickCount64())) {
+    bool started = channelMode ? g_talkSession->startChannel(sch, channel, data.options, GetTickCount64())
+        : g_talkSession->start(sch, client, uid, data.options, GetTickCount64());
+    if (started) {
         g.talkBack = data.options; saveSettings();
     } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start Talk Back. Activate your microphone, unmute playback, and release any whisper hotkey first.");
 }
@@ -1396,7 +1419,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 23;
+    const int count = 25;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -1417,6 +1440,7 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_POKE_START_CH,  "Poke: Start (everyone here)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_CHAOS_START_CH, "Chaos (move + poke): Start (everyone here)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_COPIES_CH,     "Make copies of myself here...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_TALKBACK_CHANNEL_HERE, "Talk Back: Channel...");
     /* Global plugin menu */
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_SETTINGS,       "Settings...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_HARDSTOP,       "HARD STOP - stop everything");
@@ -1425,6 +1449,7 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES,         "Make copies of myself...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES_REMOVE,  "Remove my copies (cancel queue)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_TALKBACK_STOP_ALL, "Talk Back: Stop");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_TALKBACK_CHANNEL, "Talk Back: Channel...");
     (*menuItems)[n++] = NULL;
 
     *menuIcon = NULL;
@@ -1519,6 +1544,12 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
     case MENU_TALKBACK_STOP_ALL:
         stopTalkBack();
         break;
+    case MENU_TALKBACK_CHANNEL:
+        if (type == PLUGIN_MENU_TYPE_GLOBAL) openTalkBack(serverConnectionHandlerID, 0, true);
+        break;
+    case MENU_TALKBACK_CHANNEL_HERE:
+        if (type == PLUGIN_MENU_TYPE_CHANNEL) openTalkBack(serverConnectionHandlerID, 0, true, channelTarget);
+        break;
     case MENU_COPIES:
         openCopies(serverConnectionHandlerID, 0);
         break;
@@ -1589,7 +1620,7 @@ int ts3plugin_onClientPokeEvent(uint64 serverConnectionHandlerID, anyID fromClie
 
 void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int status,
                                        int isReceivedWhisper, anyID clientID) {
-    (void)isReceivedWhisper;
+    if (status == STATUS_TALKING) g_talkAudio.talkStatus(serverConnectionHandlerID, clientID, isReceivedWhisper != 0);
     if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening) return;
     if (status != STATUS_TALKING) return;
 

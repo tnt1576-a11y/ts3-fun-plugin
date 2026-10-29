@@ -4,7 +4,7 @@ A client-side plugin for messing with friends on your own TS3 server.
 
 - **Random Move** — keep moving a chosen user into a random *empty* channel on a timer.
 - **Make copies of myself** — enter how many extra connections to join, in ordinary TS3 tabs.
-- **Talk Back** — stream a live pitched echo of a selected person's voice as a private whisper to them.
+- **Talk Back** — stream a live pitched echo privately to one person, or back to everyone in your channel as normal voice.
 - **Poke** — keep poking a chosen user with a custom or random message on a timer.
 - **HARD STOP** — one click halts everything.
 - **Settings** — native dialog for intervals and messages (saved to `funplugin.ini`).
@@ -75,6 +75,7 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 **Right-click a CHANNEL** (group actions on everyone in it):
 - **Random Move / Poke / Chaos everyone here**
 - **Make copies of myself here...** — choose the extra copy count and join this channel.
+- **Talk Back: Channel...** — echo your current channel through your user so everyone there hears it.
 
 **Global plugin menu:** **Settings...**, **HARD STOP - stop everything**,
 **Self-lock: ON / OFF**, **Make copies of myself...**, and **Remove my copies (cancel queue)**.
@@ -136,11 +137,20 @@ is not mixed into the echo. Stop restores your original microphone settings
 and normal channel routing. Saved whisper presets are not edited. Small audio
 buffers stay in memory; the effect creates no recordings or voice files.
 
-Only one person can be selected at a time. **Talk Back: Stop**
-in the person's menu or the global plugin menu, and **HARD STOP**, cancel the effect,
-discard buffered audio and restore your microphone. Leaving the channel, losing
-the connection, a rejected whisper, or manually muting also stops it. The copy
-feature keeps its existing joining speed and tab cleanup.
+For the whole channel, choose **Talk Back: Channel...** in the global plugin menu
+or right-click the channel you are in. Choose the same pitch and volume options.
+Everyone else's audible channel voice is echoed live through **your user as normal
+channel voice**, so everyone in that channel can hear it. Overlapping speakers are
+mixed together at their original pace. People who join your channel are included
+automatically. Your own voice and received private whispers are excluded. Channel
+mode needs normal speaking permission; it does not need whisper permission.
+
+Only one Talk Back mode can run at a time. **Talk Back: Stop** in the global plugin
+menu and **HARD STOP** cancel either mode, discard buffered audio, and restore your
+microphone. Private mode can also be stopped from the selected person's menu.
+Leaving the channel, losing the connection, or manually muting also stops the
+effect. Start it again in the new channel after moving. A rejected whisper stops
+private mode, and activating a whisper hotkey stops channel mode.
 
 **Self-lock** protects *you*: while ON, if anyone force-moves or channel-kicks you out
 of your channel, you snap right back. It also covers **server kicks** — if someone kicks

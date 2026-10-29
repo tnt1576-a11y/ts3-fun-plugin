@@ -14,6 +14,8 @@
 #define IDC_TB_UP           1212
 #define IDC_TB_STRENGTH     1213
 #define IDC_TB_VOLUME       1215
+#define IDC_TB_LABEL        1216
+#define IDC_TB_HELP         1217
 
 /* Move settings */
 #define IDC_MOVE_INTERVAL   1001  /* edit: seconds between moves          */

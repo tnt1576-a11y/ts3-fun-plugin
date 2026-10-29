@@ -19,12 +19,13 @@ gdi = c.WinDLL("gdi32", use_last_error=True)
 DialogProc = c.WINFUNCTYPE(c.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
 
 
-def inspect_dialog(dll, preview, resource=101):
+def inspect_dialog(dll, preview, resource=101, channel=False):
     user.CreateDialogParamW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.HWND, DialogProc, w.LPARAM]
     user.CreateDialogParamW.restype = w.HWND
     user.GetDlgItem.argtypes = [w.HWND, c.c_int]
     user.GetDlgItem.restype = w.HWND
     user.SetDlgItemTextW.argtypes = [w.HWND, c.c_int, w.LPCWSTR]
+    user.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
     user.DestroyWindow.argtypes = [w.HWND]
     user.GetWindowRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
 
@@ -36,12 +37,17 @@ def inspect_dialog(dll, preview, resource=101):
     window = user.CreateDialogParamW(dll._handle, c.cast(c.c_void_p(resource), w.LPCWSTR), None, procedure, 0)
     assert window, c.get_last_error()
     try:
-        controls = (1200, 1201, 1202, 1203, 1, 2) if resource == 101 else (1210, 1211, 1212, 1213, 1215, 1, 2)
+        controls = (1200, 1201, 1202, 1203, 1, 2) if resource == 101 else (1210, 1211, 1212, 1213, 1215, 1216, 1217, 1, 2)
         for control in controls:
             assert user.GetDlgItem(window, control), f"Missing dialog control {control}"
         values = ((1200, "5"), (1201, "Player"), (1202, "test password"), (1203, "Lobby / Party channel")) if resource == 101 else ((1210, "Selected friend"), (1213, "6"), (1215, "75"))
         for control, value in values:
             assert user.SetDlgItemTextW(window, control, value)
+        if channel:
+            assert user.SetWindowTextW(window, "Fun Plugin - Channel Talk Back")
+            assert user.SetDlgItemTextW(window, 1210, "Lobby / Party channel")
+            assert user.SetDlgItemTextW(window, 1216, "Echo channel:")
+            assert user.SetDlgItemTextW(window, 1217, "Live pitched echo through your current user.\nEveryone in this channel hears it as normal voice.\nYour microphone is replaced by the echo until Stop.")
         if preview:
             from PIL import Image
 
@@ -87,7 +93,8 @@ def inspect_dialog(dll, preview, resource=101):
                 pixels = c.create_string_buffer(width * height * 4)
                 assert gdi.GetDIBits(memory, bitmap, 0, height, pixels, c.byref(info), 0)
                 assert len(set(pixels.raw)) > 8, "Dialog preview is blank"
-                output = ROOT / ("tests/bin/copies-dialog.png" if resource == 101 else "tests/bin/talk-back-dialog.png")
+                name = "copies-dialog" if resource == 101 else "channel-talk-back-dialog" if channel else "talk-back-dialog"
+                output = ROOT / f"tests/bin/{name}.png"
                 output.parent.mkdir(exist_ok=True)
                 Image.frombytes("RGB", (width, height), pixels.raw, "raw", "BGRX").save(output)
                 print(f"Dialog preview: {output}")
@@ -103,7 +110,7 @@ def main():
     with zipfile.ZipFile(ROOT / "dist/ts3-fun-plugin.ts3_plugin") as archive:
         assert archive.namelist() == ["package.ini", "plugins/funplugin_win64.dll"]
         assert archive.testzip() is None
-        assert b"Version = 2.13" in archive.read("package.ini")
+        assert b"Version = 2.14" in archive.read("package.ini")
         binary = archive.read("plugins/funplugin_win64.dll")
         assert binary == (ROOT / "funplugin_win64.dll").read_bytes()
 
@@ -125,7 +132,7 @@ def main():
         initialized = False
         try:
             dll.ts3plugin_version.restype = c.c_char_p
-            assert dll.ts3plugin_version() == b"2.13"
+            assert dll.ts3plugin_version() == b"2.14"
             assert dll.ts3plugin_apiVersion() == 26
             config = (temporary + "\\").encode("utf-8") + b"\0"
 
@@ -146,15 +153,16 @@ def main():
             dll.ts3plugin_freeMemory.argtypes = [c.c_void_p]
             dll.ts3plugin_initMenus(c.byref(menus), c.byref(icon))
             labels = []
-            for i in range(24):
+            for i in range(26):
                 if not menus[i]:
                     break
                 labels.append(menus[i].contents.text.decode())
                 dll.ts3plugin_freeMemory(menus[i])
             dll.ts3plugin_freeMemory(menus)
-            assert len(labels) == 23
+            assert len(labels) == 25
             assert "Talk Back: Start..." in labels
             assert labels.count("Talk Back: Stop") == 2
+            assert labels.count("Talk Back: Channel...") == 2
             for export in ("ts3plugin_onEditPlaybackVoiceDataEvent", "ts3plugin_onEditCapturedVoiceDataEvent", "ts3plugin_onServerErrorEvent"):
                 assert getattr(dll, export)
             assert "Make copies of myself..." in labels
@@ -162,12 +170,13 @@ def main():
             assert "Remove my copies (cancel queue)" in labels
             inspect_dialog(dll, "--preview" in sys.argv)
             inspect_dialog(dll, "--preview" in sys.argv, 102)
+            inspect_dialog(dll, "--preview" in sys.argv, 102, channel=True)
         finally:
             if initialized:
                 dll.ts3plugin_shutdown()
             kernel.FreeLibrary.argtypes = [w.HMODULE]
             assert kernel.FreeLibrary(dll._handle)
-    print("PASS: exact packaged DLL loads, API/version, lifecycle, 23 menus, audio exports, both native dialogs, archive integrity")
+    print("PASS: exact packaged DLL loads, API/version, lifecycle, 25 menus, audio exports, private/channel dialogs, archive integrity")
     print("DLL SHA-256:", hashlib.sha256(binary).hexdigest())
 
 

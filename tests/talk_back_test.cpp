@@ -4,8 +4,10 @@
 #include "../src/plugin.cpp"
 namespace {
 TS3Functions fake = {};
-int micMute, ptt, hardware, outputMute, targetChannel, whisperTarget, whisperRequests;
-bool connected, priorWhisper, rejectWhisper, rejectClear, nestedStop;
+int micMute, ptt, hardware, outputMute, targetChannel, ownChannel, whisperTarget, whisperRequests, clears;
+bool connected, priorWhisper, rejectWhisper, rejectClear, nestedStop, rejectMembers, nestedMemberStop;
+std::vector<anyID> channelClients;
+std::set<anyID> receivedWhispers;
 std::string uid, vad, code;
 TalkBack::Session* current = nullptr;
 void print(uint64, const char*, PluginMessageTarget) {}
@@ -14,7 +16,17 @@ unsigned int release(void* p) { free(p); return ERROR_ok; }
 unsigned int errorText(unsigned int, char** result) { *result = _strdup("fake rejection"); return ERROR_ok; }
 unsigned int status(uint64 sch, int* result) { assert(sch == 1); *result = connected ? STATUS_CONNECTION_ESTABLISHED : STATUS_DISCONNECTED; return ERROR_ok; }
 unsigned int client(uint64 sch, anyID* result) { assert(sch == 1); *result = 7; return ERROR_ok; }
-unsigned int channel(uint64 sch, anyID who, uint64* result) { assert(sch == 1); *result = who == 42 ? targetChannel : 9; return ERROR_ok; }
+unsigned int channel(uint64 sch, anyID who, uint64* result) { assert(sch == 1); *result = who == 42 ? targetChannel : ownChannel; return ERROR_ok; }
+unsigned int members(uint64 sch, uint64 where, anyID** result) {
+    assert(sch == 1 && where == 9);
+    if (rejectMembers) return ERROR_not_connected;
+    if (nestedMemberStop) { nestedMemberStop = false; current->stop(); }
+    *result = (anyID*)calloc(channelClients.size() + 1, sizeof(anyID));
+    std::copy(channelClients.begin(), channelClients.end(), *result); return ERROR_ok;
+}
+unsigned int receiving(uint64 sch, anyID who, int* result) {
+    assert(sch == 1); *result = receivedWhispers.count(who) != 0; return ERROR_ok;
+}
 unsigned int identity(uint64 sch, anyID who, size_t flag, char** result) {
     assert(sch == 1 && who == 42 && flag == CLIENT_UNIQUE_IDENTIFIER); *result = _strdup(uid.c_str()); return ERROR_ok;
 }
@@ -58,6 +70,7 @@ void createCode(const char* id, char* result, size_t length) {
 unsigned int whisper(uint64 sch, anyID me, const uint64* channels, const anyID* clients, const char* returnCode) {
     assert(sch == 1 && me == 0); ensureMicrophoneMasked();
     if (!channels && !clients) {
+        ++clears;
         if (rejectClear) return ERROR_parameter_invalid;
         whisperTarget = 0; return ERROR_ok;
     }
@@ -69,15 +82,17 @@ unsigned int whisper(uint64 sch, anyID me, const uint64* channels, const anyID* 
     return ERROR_ok;
 }
 void reset() {
-    g_talkAudio.stop(); micMute = ptt = hardware = 1; outputMute = 0; targetChannel = 9;
+    g_talkAudio.stop(); micMute = ptt = hardware = 1; outputMute = 0; targetChannel = ownChannel = 9;
     whisperTarget = whisperRequests = 0; connected = true; priorWhisper = rejectWhisper = rejectClear = nestedStop = false;
     uid = "synthetic-user-uid"; vad = "true";
+    channelClients = {7, 42, 43}; receivedWhispers.clear(); clears = 0; rejectMembers = nestedMemberStop = false;
     fake = {};
     fake.getConnectionStatus = status; fake.getClientID = client; fake.getChannelOfClient = channel;
     fake.getClientVariableAsString = identity; fake.getClientSelfVariableAsInt = getInt;
     fake.setClientSelfVariableAsInt = setInt; fake.flushClientSelfUpdates = flush;
     fake.getPreProcessorConfigValue = getVad; fake.setPreProcessorConfigValue = setVad;
     fake.isWhispering = isWhispering; fake.requestClientSetWhisperList = whisper; fake.createReturnCode = createCode;
+    fake.getChannelClientList = members; fake.isReceivingWhisper = receiving;
     fake.freeMemory = release; fake.getErrorMessage = errorText; fake.printMessage = print; fake.printMessageToCurrentTab = printCurrent;
     // No guiConnect, custom device, physical device, recording, or activation functions are supplied.
 }
@@ -99,6 +114,7 @@ void restored() { assert(micMute == 1 && ptt == 1 && vad == "true" && !whisperTa
 }
 
 int main() {
+    InitializeCriticalSection(&cs);
     auto voice = sine(); TalkBack::Options options;
     for (int semitones : {-12, 12}) {
         options.semitones = semitones; TalkBack::Pitch shift; shift.reset(options);
@@ -191,18 +207,126 @@ int main() {
     reset();
     {
         TalkBack::Session session(fake, g_talkAudio, "offline-test"); start(session);
-        InitializeCriticalSection(&cs); ts3Functions = fake; g_talkSession = &session;
-        hardStop(); g_talkSession = nullptr; DeleteCriticalSection(&cs); restored();
+        ts3Functions = fake; g_talkSession = &session;
+        hardStop(); g_talkSession = nullptr; restored();
     }
     reset();
     {
         TalkBack::Session session(fake, g_talkAudio, "offline-test"); start(session);
         rejectClear = true; session.stop(); assert(micMute == 1 && !g_talkAudio.captureConnection.load());
     }
+    // Overlapping speakers mix at 48 kHz, rather than filling one serial queue.
+    reset();
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(session.startChannel(1, 9, options, 0) && session.channelMode());
+        assert(!whisperTarget && !whisperRequests && clears == 1 && !micMute && !ptt && vad == "false");
+        TalkBack::Pitch reference; reference.reset(options);
+        for (int block = 0; block < 100; ++block) {
+            short a[960], b[960], expected[960], mic[1920];
+            for (int i = 0; i < 960; ++i) {
+                a[i] = voice[block * 960 + i];
+                b[i] = (short)(6000 * std::sin(6.283185307179586 * 660 * (block * 960 + i) / TalkBack::rate));
+                expected[i] = reference.process((short)(a[i] + b[i]));
+            }
+            ts3plugin_onEditPlaybackVoiceDataEvent(1, 42, a, 960, 1);
+            ts3plugin_onEditPlaybackVoiceDataEvent(1, 43, b, 960, 1);
+            ts3plugin_onEditPlaybackVoiceDataEvent(1, 7, a, 960, 1); // Own voice.
+            ts3plugin_onEditPlaybackVoiceDataEvent(1, 44, a, 960, 1); // Outside this channel.
+            ts3plugin_onEditPlaybackVoiceDataEvent(2, 42, a, 960, 1); // Another server tab.
+            std::fill(mic, mic + 1920, (short)30000); int edited = 4;
+            ts3plugin_onEditCapturedVoiceDataEvent(1, mic, 960, 2, &edited);
+            assert((edited & 7) == 7);
+            for (int i = 0; i < 960; ++i) assert(mic[2 * i] == expected[i] && mic[2 * i + 1] == expected[i]);
+        }
+        session.tick(10000); assert(session.active() && !whisperRequests);
+        session.stop(); restored();
+    }
+    reset();
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(session.startChannel(1, 9, options, 0));
+        short loud[960]; std::fill(loud, loud + 960, (short)25000);
+        for (int i = 0; i < 100; ++i) {
+            g_talkAudio.receive(1, 42, loud, 960, 1);
+            g_talkAudio.receive(1, 43, loud, 960, 1);
+        }
+        int blocks = 0;
+        while (g_talkAudio.render(output, 960)) {
+            assert(++blocks <= 14); // 200 ms per speaker, mixed at the same time.
+            for (short sample : output) assert(sample >= 0 && sample <= 24576); // Saturate; never wrap.
+        }
+        assert(blocks >= 10); session.stop(); restored();
+    }
+    // Never broadcast received whispers, including one already in progress.
+    reset(); receivedWhispers.insert(42);
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(session.startChannel(1, 9, options, 0));
+        ts3plugin_onEditPlaybackVoiceDataEvent(1, 42, voice.data(), 960, 1);
+        assert(!g_talkAudio.render(output, 960));
+        channelClients.push_back(44); session.tick(100);
+        ts3plugin_onEditPlaybackVoiceDataEvent(1, 44, voice.data(), 960, 1);
+        assert(g_talkAudio.render(output, 960));
+        for (int i = 0; i < 4; ++i) g_talkAudio.render(output, 960);
+        ts3plugin_onTalkStatusChangeEvent(1, STATUS_TALKING, 1, 44);
+        ts3plugin_onEditPlaybackVoiceDataEvent(1, 44, voice.data(), 960, 1);
+        assert(!g_talkAudio.render(output, 960));
+        ts3plugin_onTalkStatusChangeEvent(1, STATUS_TALKING, 0, 44);
+        ts3plugin_onEditPlaybackVoiceDataEvent(1, 44, voice.data(), 960, 1);
+        assert(g_talkAudio.render(output, 960));
+        g_talkAudio.departed(1, 44); channelClients.pop_back(); session.tick(200);
+        for (int i = 0; i < 4; ++i) g_talkAudio.render(output, 960);
+        ts3plugin_onEditPlaybackVoiceDataEvent(1, 44, voice.data(), 960, 1);
+        assert(!g_talkAudio.render(output, 960) && session.active());
+        channelClients.push_back(44); session.tick(300); // Same ID rejoining.
+        ts3plugin_onEditPlaybackVoiceDataEvent(1, 44, voice.data(), 960, 1);
+        assert(g_talkAudio.render(output, 960));
+        g_talkAudio.departed(1, 7); session.tick(400); restored();
+    }
+    reset(); rejectMembers = true;
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(!session.startChannel(1, 9, options, 0)); restored();
+    }
+    reset(); rejectClear = true;
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(!session.startChannel(1, 9, options, 0) && !whisperRequests); restored();
+    }
+    reset();
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(!session.startChannel(1, 10, options, 0)); restored(); // Moved during dialog.
+        assert(session.startChannel(1, 9, options, 0)); ownChannel = 10; session.tick(100); restored();
+    }
+    reset();
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(session.startChannel(1, 9, options, 0)); priorWhisper = true;
+        session.tick(100); restored(); // Stop if a whisper hotkey takes over.
+    }
+    reset();
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(session.startChannel(1, 9, options, 0)); ts3Functions = fake; g_talkSession = &session;
+        hardStop(); g_talkSession = nullptr; restored();
+    }
+    reset();
+    {
+        TalkBack::Session session(fake, g_talkAudio, "offline-test");
+        assert(session.startChannel(1, 9, options, 0)); current = &session; nestedMemberStop = true;
+        session.tick(100); assert(!session.active()); restored();
+    }
     TalkBackDialog data; data.name = L"Synthetic friend"; hInstance = GetModuleHandleW(NULL);
     HWND dialog = CreateDialogParamW(hInstance, MAKEINTRESOURCEW(IDD_TALKBACK), NULL, talkBackProc, (LPARAM)&data);
     assert(dialog && IsDlgButtonChecked(dialog, IDC_TB_DOWN) == BST_CHECKED);
     assert(GetDlgItemInt(dialog, IDC_TB_STRENGTH, NULL, FALSE) == 6);
     assert(copyField(dialog, IDC_TB_TARGET) == "Synthetic friend" && !GetDlgItem(dialog, 1214)); DestroyWindow(dialog);
-    std::cout << "PASS: live original-user echo, pitch up/down at original pace, no extra connection/device/recorder, no success callback wait, private routing, raw mic exclusion, bounded FIFO, failure/cancel/HARD STOP rollback, mute/PTT/VAD restoration, native dialog\n";
+    data.channel = true; data.name = L"Synthetic channel";
+    dialog = CreateDialogParamW(hInstance, MAKEINTRESOURCEW(IDD_TALKBACK), NULL, talkBackProc, (LPARAM)&data);
+    assert(dialog && copyField(dialog, IDC_TB_LABEL) == "Echo channel:");
+    assert(copyField(dialog, IDC_TB_HELP).find("Everyone in this channel") != std::string::npos); DestroyWindow(dialog);
+    DeleteCriticalSection(&cs);
+    std::cout << "PASS: live private and channel echo, simultaneous speaker mixing, membership changes, received whisper exclusion, original pace, raw mic exclusion, bounded FIFO, failure/cancel/HARD STOP rollback, mute/PTT/VAD restoration, both dialog modes\n";
 }

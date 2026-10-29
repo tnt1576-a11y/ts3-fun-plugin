@@ -373,7 +373,7 @@ int main() {
     ts3plugin_initMenus(&menus, &icon);
     int menuCount = 0;
     for (; menus[menuCount]; ++menuCount) free(menus[menuCount]);
-    free(menus); assert(menuCount == 23);
+    free(menus); assert(menuCount == 25);
     assert(FindResourceW(hInstance, MAKEINTRESOURCEW(IDD_COPIES), MAKEINTRESOURCEW(5)));
     g.selfLockOn = 1; selfLock = 1; selfLockSch = 1; selfLockChannel = 9;
     assert(g_copies->start(request(1), GetTickCount64()));
