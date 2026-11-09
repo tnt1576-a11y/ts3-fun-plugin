@@ -16,6 +16,11 @@
 #define IDC_TB_VOLUME       1215
 #define IDC_TB_LABEL        1216
 #define IDC_TB_HELP         1217
+#define IDD_DIRECT_SEND     103
+#define IDC_SEND_TARGET     1220
+#define IDC_SEND_COUNT      1221
+#define IDC_SEND_TEXT       1222
+#define IDC_SEND_HELP       1223
 
 /* Move settings */
 #define IDC_MOVE_INTERVAL   1001  /* edit: seconds between moves          */

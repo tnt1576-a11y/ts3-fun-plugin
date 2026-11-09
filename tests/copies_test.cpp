@@ -193,8 +193,11 @@ int main() {
             assert(names.size() == (size_t)i + 1); // Wait through the settling period.
         }
         assert(!manager.busy() && manager.count() == 5);
+        assert((manager.senders(1) == std::vector<uint64>{100, 101, 102, 103, 104}));
+        assert(manager.senders(2).empty());
         assert(lastAddress == "[::1]:9987" && lastChannel == "Parent/Party" && lastPassword == "test-channel-password");
         manager.stopAll(); assert(closed.size() == 2); // Bounded cleanup per GUI tick.
+        assert(manager.senders(1).empty());
         drain(manager);
         assert(stops.size() == 5 && names.size() == 5);
         assert(closed.size() == 5 && tabs.size() == 2 && focused == 1);
@@ -373,7 +376,7 @@ int main() {
     ts3plugin_initMenus(&menus, &icon);
     int menuCount = 0;
     for (; menus[menuCount]; ++menuCount) free(menus[menuCount]);
-    free(menus); assert(menuCount == 25);
+    free(menus); assert(menuCount == 28);
     assert(FindResourceW(hInstance, MAKEINTRESOURCEW(IDD_COPIES), MAKEINTRESOURCEW(5)));
     g.selfLockOn = 1; selfLock = 1; selfLockSch = 1; selfLockChannel = 9;
     assert(g_copies->start(request(1), GetTickCount64()));

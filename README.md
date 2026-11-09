@@ -6,6 +6,8 @@ A client-side plugin for messing with friends on your own TS3 server.
 - **Make copies of myself** — enter how many extra connections to join, in ordinary TS3 tabs.
 - **Talk Back** — stream a live pitched echo privately to one person, or back to everyone in your channel as normal voice.
 - **Poke** — keep poking a chosen user with a custom or random message on a timer.
+- **Poke Pack** — choose a count and text, confirm the warning, then send immediately without the Settings timer.
+- **Poke / Message from my copies** — send once to a selected user from each connected copy belonging to your original tab.
 - **HARD STOP** — one click halts everything.
 - **Settings** — native dialog for intervals and messages (saved to `funplugin.ini`).
 
@@ -65,6 +67,8 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 **Right-click a USER:**
 - **Random Move: Start / Stop**
 - **Poke: Start / Stop**
+- **Poke Pack...**
+- **Poke from my copies... / Message from my copies...**
 - **Chaos (move + poke): Start / Stop** — both at once
 - **Talk-poke: Arm / Disarm** — pokes them every time they start talking
 - **Talk-move: Arm / Disarm** — moves them to another channel every time they start
@@ -79,6 +83,31 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 
 **Global plugin menu:** **Settings...**, **HARD STOP - stop everything**,
 **Self-lock: ON / OFF**, **Make copies of myself...**, and **Remove my copies (cancel queue)**.
+
+### Poke Pack and sending from copies
+
+Right-click a user on your original connected tab and choose **Poke Pack...**.
+Enter a positive whole-number amount and the message to repeat. The message starts
+with a selection from your current Poke settings and can be edited. Confirm the
+warning before sending. This submits requests as fast as TeamSpeak accepts them,
+without the Settings interval or timed-job limiter. It does not guarantee simultaneous
+delivery. The UI stays responsive and **HARD STOP** cancels requests not yet submitted.
+
+After making copies, right-click a user on the original tab and choose **Poke from
+my copies...** or **Message from my copies...**. The dialog shows the connected copy
+count. Each of those copies sends the entered text once; your original connection
+does not send. Copies created from another original tab, connecting copies, and
+unrelated tabs are excluded. Copies that join after the dialog opens are not added.
+Messages are private to the selected user. Unicode text is supported; pokes allow
+100 UTF-8 bytes and private messages 8192 bytes.
+
+Both actions ask for confirmation and are intended for your own server with the
+recipient's agreement. Server permissions and flood limits still apply. A reported
+rejection, disconnect, or changed recipient/server stops pending requests; no retry
+or limit bypass is attempted. Submitted requests cannot be recalled, and server
+errors may arrive after the batch has already been submitted. The result reports
+submitted requests, not confirmed deliveries. **Remove my copies**, **HARD STOP**,
+and unloading the plugin also cancel these sends.
 
 ### Make copies of myself
 
@@ -184,12 +213,25 @@ Open **Settings...** for the move/poke intervals, message mode, and:
 - **Auto-create temporary empty channels** — if on, the plugin spawns throwaway empty
   channels to move the victim into (they self-delete when empty).
 
-### Very fast timing (below 0.1s)
-The interval fields accept decimals down to `0.01` (10 ms). **But** the server's
-anti-flood protection will start blocking commands — and can briefly kick you — if you
-fire moves/pokes too fast. To actually use ultra-fast speeds, grant your group the
-`b_client_ignore_antiflood` permission on your server (you're the owner). Otherwise keep
-intervals around `0.3s`+ to stay safe.
+### Maximum-speed move and poke
+
+In **Settings**, set seconds between moves and/or pokes to **`0`** for maximum
+speed. Stop and restart the corresponding action to apply a changed interval.
+Zero removes the plugin's timed pause; workers yield the CPU between rounds and
+check Stop between targets. Positive values support **`0.001` seconds** (1 ms).
+Positive waits use a high-resolution Windows timer when supported, with a fallback
+on older systems. SDK work still adds to the configured delay.
+
+Random Move avoids repeating its last requested destination while TeamSpeak's
+channel state catches up. If there is nowhere eligible to move, it briefly waits
+instead of spinning. **HARD STOP** and the auto-stop limiter still work. Rejected
+requests and disconnects stop the affected job; server errors remain visible in
+TeamSpeak. Requests already submitted cannot be recalled.
+
+These are request speeds, not guaranteed visible moves/pokes per second. TeamSpeak,
+network latency, and server processing/flood limits determine the actual result.
+Maximum speed can trigger flood protection or a kick; it does not bypass server
+permissions or limits. Use it on your own server with the recipient's agreement.
 
 ## Notes
 - You are the server owner, so channel-move / channel-create permissions are assumed.

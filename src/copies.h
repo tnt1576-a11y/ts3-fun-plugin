@@ -217,6 +217,19 @@ public:
     bool busy() const { return running; }
     size_t count() const { return owned.size(); }
 
+    // Snapshot only established copies created from this original tab.
+    std::vector<uint64> senders(uint64 source) const {
+        std::vector<uint64> result;
+        for (const auto& entry : owned) {
+            const Copy& copy = entry.second;
+            int status = STATUS_DISCONNECTED;
+            if (copy.source == source && copy.established && !copy.stopping && !copy.disconnected &&
+                api.getConnectionStatus(entry.first, &status) == ERROR_ok && status == STATUS_CONNECTION_ESTABLISHED)
+                result.push_back(entry.first);
+        }
+        return result;
+    }
+
     bool start(const Request& request, uint64 now) {
         if (running || ticking || request.count <= 0 || !request.source || !request.channel ||
             request.address.empty() || request.channelPath.empty() || request.baseNickname.empty() || owns(request.source))
