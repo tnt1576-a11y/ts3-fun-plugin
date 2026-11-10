@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <set>
 #include <utility>
 
@@ -55,7 +56,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.17"
+#define PLUGIN_VERSION "2.18"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
@@ -440,14 +441,23 @@ struct Job {
     std::map<anyID, uint64> lastMoveAt;
     uint64 epoch = 0;
     DWORD startedAt = 0;
-    std::vector<uint64> senders; // Empty = original tab. Otherwise a frozen copy list.
+    uint64 copySender = 0; // One independent worker per copy and action; zero = original tab.
     std::string serverUID, targetUID;
 };
 
 static Job moveJob;
 static Job pokeJob;
-static Job copyMoveJob;
-static Job copyPokeJob;
+typedef std::vector<std::unique_ptr<Job>> CopyJobs;
+static CopyJobs copyMoveJobs;
+static CopyJobs copyPokeJobs;
+
+// Caller holds cs. Copy workers remain registered until joined, then are removed under cs.
+static std::vector<Job*> allJobsLocked() {
+    std::vector<Job*> result = {&moveJob, &pokeJob};
+    for (auto& job : copyMoveJobs) result.push_back(job.get());
+    for (auto& job : copyPokeJobs) result.push_back(job.get());
+    return result;
+}
 
 static void signalJob(Job& j) { if (j.stopEvent) SetEvent(j.stopEvent); }
 
@@ -475,7 +485,7 @@ static void stopJob(Job& j) {
 }
 
 /* create the stop event + worker thread (caller must have stopped any prior run) */
-static void launchJob(Job& j, LPTHREAD_START_ROUTINE fn) {
+static bool launchJob(Job& j, LPTHREAD_START_ROUTINE fn) {
     EnterCriticalSection(&cs);
     j.stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     // High-resolution waitable timer when supported; ordinary timer otherwise.
@@ -486,10 +496,12 @@ static void launchJob(Job& j, LPTHREAD_START_ROUTINE fn) {
     j.returnCode = code;
     j.epoch = g_sendWindow.epoch();
     j.startedAt = GetTickCount();
+    g_sendWindow.restartConnection(j.copySender ? j.copySender : j.sch);
     InterlockedExchange(&j.active, 1);
     j.thread = j.stopEvent ? CreateThread(NULL, 0, fn, &j, 0, NULL) : NULL;
     LeaveCriticalSection(&cs);
     if (!j.thread) stopJob(j);
+    return j.thread != NULL;
 }
 
 /* interruptible sleep; returns true if we were told to stop */
@@ -531,8 +543,8 @@ static bool jobRequest(Job* j, unsigned int error) {
 static void jobReply(uint64 sch, const char* code, unsigned int error) {
     if (!code || error == ERROR_ok || error == ERROR_ok_no_update) return;
     EnterCriticalSection(&cs);
-    for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob})
-        if ((job->sch == sch || std::find(job->senders.begin(), job->senders.end(), sch) != job->senders.end()) &&
+    for (Job* job : allJobsLocked())
+        if ((job->sch == sch || job->copySender == sch) &&
             !job->returnCode.empty() && job->returnCode == code && job->stopEvent)
             SetEvent(job->stopEvent);
     LeaveCriticalSection(&cs);
@@ -722,7 +734,7 @@ static uint64 pendingDestination(Job* j, anyID target, uint64 current) {
 }
 
 static bool validCopySender(Job* j, uint64 sender) {
-    if (j->senders.empty()) return true;
+    if (!j->copySender) return true;
     for (uint64 connection : {j->sch, sender}) {
         int status = STATUS_DISCONNECTED;
         if (ts3Functions.getConnectionStatus(connection, &status) != ERROR_ok || status != STATUS_CONNECTION_ESTABLISHED ||
@@ -747,7 +759,7 @@ static bool doOneMove(Job* j, uint64 sender = 0) {
     if (jobStopped(j) || !validCopySender(j, sender)) return false;
     bool sent = false;
     EnterCriticalSection(&cs);
-    bool usePool = g.autoCreateTemp != 0 && j->senders.empty();
+    bool usePool = g.autoCreateTemp != 0 && !j->copySender;
     LeaveCriticalSection(&cs);
     /* Pool mode: move only among the channels we created. */
     if (usePool) {
@@ -853,12 +865,7 @@ static DWORD WINAPI moveThread(LPVOID p) {
     srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)j);
     DWORD start = GetTickCount();
     while (!jobStopped(j)) {
-        bool sent = false;
-        if (j->senders.empty()) sent = doOneMove(j);
-        else for (uint64 sender : j->senders) {
-            if (jobStopped(j)) break;
-            sent = doOneMove(j, sender) || sent;
-        }
+        bool sent = doOneMove(j, j->copySender);
         if (limitReached(j, start)) break;
         if (sleepOrStop(j, sent ? j->intervalMs : (std::max)(10, j->intervalMs))) break;
         if (limitReached(j, start)) break;
@@ -872,11 +879,7 @@ static DWORD WINAPI pokeThread(LPVOID p) {
     srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)j);
     DWORD start = GetTickCount();
     while (!jobStopped(j)) {
-        if (j->senders.empty()) doOnePoke(j);
-        else for (uint64 sender : j->senders) {
-            if (jobStopped(j)) break;
-            doOnePoke(j, sender);
-        }
+        doOnePoke(j, j->copySender);
         if (limitReached(j, start)) break;
         if (sleepOrStop(j, j->intervalMs)) break;
         if (limitReached(j, start)) break;
@@ -939,11 +942,22 @@ static void stopMove() {
 }
 static void stopPoke() { stopJob(pokeJob); }
 
+static void stopCopyGroup(CopyJobs& group) {
+    EnterCriticalSection(&cs);
+    for (auto& job : group) signalJob(*job);
+    LeaveCriticalSection(&cs);
+    for (auto& job : group) stopJob(*job);
+    EnterCriticalSection(&cs);
+    group.clear();
+    LeaveCriticalSection(&cs);
+}
+
 static void stopCopyJobs() {
     EnterCriticalSection(&cs);
-    signalJob(copyMoveJob); signalJob(copyPokeJob);
+    for (auto& job : copyMoveJobs) signalJob(*job);
+    for (auto& job : copyPokeJobs) signalJob(*job);
     LeaveCriticalSection(&cs);
-    stopJob(copyMoveJob); stopJob(copyPokeJob);
+    stopCopyGroup(copyMoveJobs); stopCopyGroup(copyPokeJobs);
 }
 
 static void startCopyActions(uint64 sch, anyID target, bool move, bool poke) {
@@ -969,7 +983,7 @@ static void startCopyActions(uint64 sch, anyID target, bool move, bool poke) {
         allMode = 1;
     }
     std::wstring warning = L"Start " + std::wstring(move && poke ? L"Chaos" : move ? L"Random Move" : L"Poke") +
-        L" from " + std::to_wstring(senders.size()) + L" connected copies?\n\nUses your Settings intervals and limiter. "
+        L" from " + std::to_wstring(senders.size()) + L" connected copies?\n\nEach copy independently uses your Settings intervals and limiter. "
         L"Moves use existing channels. Your original tab will not send.\n\nUse only on your own server with the recipient's agreement. "
         L"Server limits apply. HARD STOP stops all copies and pending actions.";
     if (MessageBoxW(GetForegroundWindow(), warning.c_str(), L"Start actions from my copies", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
@@ -978,17 +992,27 @@ static void startCopyActions(uint64 sch, anyID target, bool move, bool poke) {
     for (uint64 sender : senders) if (std::find(ready.begin(), ready.end(), sender) == ready.end()) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Copies changed. Open the action again."); return;
     }
-    for (Job* job : {move ? &copyMoveJob : nullptr, poke ? &copyPokeJob : nullptr}) {
-        if (!job) continue;
-        stopJob(*job);
-        EnterCriticalSection(&cs);
-        job->sch = sch; job->targets = {target}; job->senders = senders;
-        job->serverUID = serverUID; job->targetUID = targetUID;
-        job->allChannels = allMode;
-        job->intervalMs = job == &copyMoveJob ? g.moveIntervalMs : g.pokeDelayMs;
-        job->limiterMs = (int)((std::min)((uint64)(std::max)(0, g.limiterSec) * 1000, (uint64)INT_MAX));
-        LeaveCriticalSection(&cs);
-        launchJob(*job, job == &copyMoveJob ? moveThread : pokeThread);
+    for (CopyJobs* group : {move ? &copyMoveJobs : nullptr, poke ? &copyPokeJobs : nullptr}) {
+        if (!group) continue;
+        stopCopyGroup(*group);
+        for (uint64 sender : senders) {
+            std::unique_ptr<Job> owned(new Job{});
+            Job* job = owned.get();
+            job->sch = sch; job->targets = {target}; job->copySender = sender;
+            job->serverUID = serverUID; job->targetUID = targetUID;
+            job->allChannels = allMode;
+            job->intervalMs = group == &copyMoveJobs ? g.moveIntervalMs : g.pokeDelayMs;
+            job->limiterMs = (int)((std::min)((uint64)(std::max)(0, g.limiterSec) * 1000, (uint64)INT_MAX));
+            EnterCriticalSection(&cs);
+            group->push_back(std::move(owned));
+            LeaveCriticalSection(&cs);
+            if (!launchJob(*job, group == &copyMoveJobs ? moveThread : pokeThread)) {
+                if (move) stopCopyGroup(copyMoveJobs);
+                if (poke) stopCopyGroup(copyPokeJobs);
+                ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start all copy workers. Requested copy actions stopped.");
+                return;
+            }
+        }
     }
 }
 
@@ -997,12 +1021,11 @@ static void stopAllJobs() {
     uint64 sch;
     sch = moveJob.sch;
     EnterCriticalSection(&cs);
-    for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob}) signalJob(*job);
+    for (Job* job : allJobsLocked()) signalJob(*job);
     LeaveCriticalSection(&cs);
     stopJob(moveJob);
     stopJob(pokeJob);
-    stopJob(copyMoveJob);
-    stopJob(copyPokeJob);
+    stopCopyJobs();
     deleteTempChannels(sch);   /* remove our pool channels (no-op if none) */
 }
 
@@ -1015,7 +1038,7 @@ static void hardStop() {
     talkTargets.clear();      /* disarm every talk-poke target */
     talkMoveTargets.clear();  /* disarm every talk-move target */
     g.autoPokeBack = 0;       /* stop reacting to incoming pokes */
-    for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob}) signalJob(*job);
+    for (Job* job : allJobsLocked()) signalJob(*job);
     LeaveCriticalSection(&cs);
     g_directSend.stop();
     stopAllJobs();
@@ -1829,8 +1852,8 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         if (type == PLUGIN_MENU_TYPE_CLIENT)
             startCopyActions(serverConnectionHandlerID, clientTarget, menuItemID != MENU_COPIES_POKE_START, menuItemID != MENU_COPIES_MOVE_START);
         break;
-    case MENU_COPIES_POKE_STOP: stopJob(copyPokeJob); break;
-    case MENU_COPIES_MOVE_STOP: stopJob(copyMoveJob); break;
+    case MENU_COPIES_POKE_STOP: stopCopyGroup(copyPokeJobs); break;
+    case MENU_COPIES_MOVE_STOP: stopCopyGroup(copyMoveJobs); break;
     case MENU_COPIES_CHAOS_STOP: stopCopyJobs(); break;
     case MENU_POKE_PACK:
     case MENU_COPIES_POKE:
@@ -2139,8 +2162,8 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     if (newStatus != STATUS_CONNECTION_ESTABLISHED) g_directSend.disconnected(serverConnectionHandlerID);
     if (newStatus == STATUS_DISCONNECTED) {
         EnterCriticalSection(&cs);
-        for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob})
-            if ((job->sch == serverConnectionHandlerID || std::find(job->senders.begin(), job->senders.end(), serverConnectionHandlerID) != job->senders.end()) && job->stopEvent)
+        for (Job* job : allJobsLocked())
+            if ((job->sch == serverConnectionHandlerID || job->copySender == serverConnectionHandlerID) && job->stopEvent)
                 SetEvent(job->stopEvent);
         LeaveCriticalSection(&cs);
     }

@@ -105,6 +105,7 @@ public:
         request = value;
         pluginID = plugin;
         epoch = window.epoch();
+        for (uint64 sender : request.senders) window.restartConnection(sender);
         returnCode = code;
         cancelled = false;
         running = true;

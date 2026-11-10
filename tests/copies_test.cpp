@@ -32,7 +32,28 @@ Copies::Manager* duringOpen = nullptr;
 bool stopDuringOpen = false;
 bool delayDisconnect = false;
 std::atomic<int> copyPokes{0}, copyMoves{0};
+std::atomic<int> pokesByCopy[2], movesByCopy[2];
+bool blockFirstCopy = false, withholdFirstCopy = false, rejectFirstCopy = false;
+HANDLE firstCopyEntered = NULL, releaseFirstCopy = NULL;
+std::map<std::pair<uint64, bool>, std::vector<uint64>> actionTimes;
 std::vector<uint64> actionSenders;
+void recordAction(uint64 sch, bool poke) {
+    EnterCriticalSection(&cs);
+    actionSenders.push_back(sch);
+    actionTimes[{sch, poke}].push_back(GetTickCount64());
+    LeaveCriticalSection(&cs);
+    if (poke) { ++copyPokes; ++pokesByCopy[sch - 100]; }
+    else { ++copyMoves; ++movesByCopy[sch - 100]; }
+    if (blockFirstCopy && sch == 100) {
+        SetEvent(firstCopyEntered);
+        assert(WaitForSingleObject(releaseFirstCopy, 3000) == WAIT_OBJECT_0);
+    }
+}
+void resetActionCounts() {
+    copyPokes = copyMoves = 0;
+    for (int i = 0; i < 2; ++i) { pokesByCopy[i] = 0; movesByCopy[i] = 0; }
+    actionTimes.clear();
+}
 unsigned int serverIdentityFake(uint64, size_t, char** result) { *result = _strdup("test-server"); return ERROR_ok; }
 unsigned int clientIdentityFake(uint64, anyID client, size_t, char** result) {
     assert(client == 77); *result = _strdup("test-target"); return ERROR_ok;
@@ -42,13 +63,16 @@ void codeFake(const char*, char* result, size_t size) {
 }
 unsigned int pokeActionFake(uint64 sch, anyID target, const char*, const char* code) {
     assert(target == 77 && (sch == 100 || sch == 101));
-    EnterCriticalSection(&cs); actionSenders.push_back(sch); LeaveCriticalSection(&cs);
-    ++copyPokes; ts3plugin_onServerErrorEvent(sch, "", ERROR_ok, code, ""); return ERROR_ok;
+    recordAction(sch, true);
+    if (!withholdFirstCopy || sch != 100)
+        ts3plugin_onServerErrorEvent(sch, "", rejectFirstCopy && sch == 100 ? ERROR_permissions : ERROR_ok, code, "");
+    return ERROR_ok;
 }
 unsigned int moveActionFake(uint64 sch, anyID target, uint64, const char*, const char* code) {
     assert(target == 77 && (sch == 100 || sch == 101));
-    EnterCriticalSection(&cs); actionSenders.push_back(sch); LeaveCriticalSection(&cs);
-    ++copyMoves; ts3plugin_onServerErrorEvent(sch, "", ERROR_ok, code, ""); return ERROR_ok;
+    recordAction(sch, false);
+    if (!withholdFirstCopy || sch != 100) ts3plugin_onServerErrorEvent(sch, "", ERROR_ok, code, "");
+    return ERROR_ok;
 }
 unsigned int channelListFake(uint64, uint64** result) {
     *result = (uint64*)calloc(4, sizeof(uint64)); (*result)[0] = 11; (*result)[1] = 12; (*result)[2] = 13; return ERROR_ok;
@@ -58,7 +82,8 @@ unsigned int channelMembersFake(uint64, uint64, anyID** result) {
 }
 void waitActions(bool poke, bool move) {
     uint64 deadline = GetTickCount64() + 3000;
-    while ((poke && copyPokes.load() < 2) || (move && copyMoves.load() < 2)) {
+    while ((poke && (pokesByCopy[0].load() < 2 || pokesByCopy[1].load() < 2)) ||
+           (move && (movesByCopy[0].load() < 2 || movesByCopy[1].load() < 2))) {
         assert(GetTickCount64() < deadline); Sleep(1);
     }
 }
@@ -435,23 +460,68 @@ int main() {
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_START, 77);
     waitActions(true, false);
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_STOP, 77);
-    assert(!copyPokeJob.thread && !pokeJob.thread);
+    assert(copyPokeJobs.empty() && !pokeJob.thread);
     assert(std::find(actionSenders.begin(), actionSenders.end(), 100) != actionSenders.end());
     assert(std::find(actionSenders.begin(), actionSenders.end(), 101) != actionSenders.end());
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_MOVE_START, 77);
     waitActions(false, true);
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_MOVE_STOP, 77);
-    assert(!copyMoveJob.thread && !moveJob.thread);
-    copyPokes = copyMoves = 0;
+    assert(copyMoveJobs.empty() && !moveJob.thread);
+    resetActionCounts();
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_START, 77);
     waitActions(true, true);
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_STOP, 77);
-    assert(!copyMoveJob.thread && !copyPokeJob.thread);
-    copyPokes = copyMoves = 0;
+    assert(copyMoveJobs.empty() && copyPokeJobs.empty());
+
+    // Hold both SDK calls for copy 100. Copy 101 must keep its own move/poke cadence.
+    resetActionCounts(); blockFirstCopy = true;
+    firstCopyEntered = CreateEvent(NULL, TRUE, FALSE, NULL);
+    releaseFirstCopy = CreateEvent(NULL, TRUE, FALSE, NULL);
+    g.pokeDelayMs = 20; g.moveIntervalMs = 45;
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_START, 77);
+    assert(copyMoveJobs.size() == 2 && copyPokeJobs.size() == 2);
+    for (const auto& job : copyMoveJobs) assert(job->intervalMs == 45);
+    for (const auto& job : copyPokeJobs) assert(job->intervalMs == 20);
+    assert(WaitForSingleObject(firstCopyEntered, 1000) == WAIT_OBJECT_0);
+    uint64 independentDeadline = GetTickCount64() + 2000;
+    while (pokesByCopy[1].load() < 5 || movesByCopy[1].load() < 4) {
+        assert(GetTickCount64() < independentDeadline); Sleep(1);
+    }
+    assert(pokesByCopy[0] == 1 && movesByCopy[0] == 1);
+    SetEvent(releaseFirstCopy);
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_STOP, 77);
+    blockFirstCopy = false; CloseHandle(firstCopyEntered); CloseHandle(releaseFirstCopy);
+    for (bool poke : {false, true}) {
+        const auto& times = actionTimes[{101, poke}];
+        // GetTickCount64 is coarse; allow one clock tick of measurement rounding.
+        for (size_t i = 1; i < times.size(); ++i) assert(times[i] - times[i - 1] >= (poke ? 15 : 30));
+    }
+
+    // A full response window on copy 100 must not consume copy 101's allowance.
+    resetActionCounts(); withholdFirstCopy = true;
+    g.moveIntervalMs = g.pokeDelayMs = 1;
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_START, 77);
+    independentDeadline = GetTickCount64() + 2000;
+    while (pokesByCopy[0].load() < (int)SendWindow::capacity || pokesByCopy[1].load() < 20) {
+        assert(GetTickCount64() < independentDeadline); Sleep(1);
+    }
+    assert(pokesByCopy[0] == (int)SendWindow::capacity);
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_STOP, 77);
+    withholdFirstCopy = false; g_sendWindow.cancelAll();
+    resetActionCounts(); rejectFirstCopy = true;
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_START, 77);
+    independentDeadline = GetTickCount64() + 2000;
+    while (pokesByCopy[1].load() < 5) { assert(GetTickCount64() < independentDeadline); Sleep(1); }
+    assert(pokesByCopy[0] == 1);
+    assert(WaitForSingleObject(copyPokeJobs[0]->thread, 1000) == WAIT_OBJECT_0);
+    assert(copyPokeJobs[1]->active);
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_STOP, 77);
+    rejectFirstCopy = false;
+    resetActionCounts();
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_START, 77);
     waitActions(true, true);
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_GLOBAL, MENU_HARDSTOP, 0);
-    assert(!copyMoveJob.thread && !copyPokeJob.thread && !actionSenders.empty());
+    assert(copyMoveJobs.empty() && copyPokeJobs.empty() && !actionSenders.empty());
     int finishedPokes = copyPokes, finishedMoves = copyMoves;
     Sleep(30); assert(copyPokes == finishedPokes && copyMoves == finishedMoves);
     assert(stops.size() == 2 && closed.size() == 2 && !g_copies->busy() && selfLockSch == 1);
@@ -459,5 +529,5 @@ int main() {
     pump(); assert(!isCopyConnection(100));
     ts3plugin_shutdown(); assert(!g_copyWindow && !g_copies);
     assert(RemoveDirectoryA(configPath.c_str()));
-    std::cout << "PASS: no-audio profiles, 50-copy batch without device churn, audio guard, nested timers/Stop, count/Unicode, queue, errors, lifecycle and self-lock isolation\n";
+    std::cout << "PASS: independent copy move/poke timers, blocked/rejected-copy isolation, per-connection queues, HARD STOP, copy lifecycle/audio/tab/self-lock isolation\n";
 }

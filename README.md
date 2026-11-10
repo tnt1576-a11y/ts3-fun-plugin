@@ -114,13 +114,18 @@ and unloading the plugin also cancel these sends.
 
 For continuous actions, use **Poke from copies: Start...**, **Random Move from
 copies: Start...**, or **Chaos from copies: Start...**. Start from the original tab
-and select the recipient there. Each round uses the connected copies present when
-you confirm. Intervals and the limiter come from Settings; restart an action after
-changing them. Copy moves use existing channels and the configured empty-channel
+and select the recipient there. Each connected copy present when you confirm gets
+its **own independent timer and worker for each action**. With a 2-second poke
+interval, each copy pokes and waits 2 seconds itself; there is no shared round or
+turn-taking. Chaos gives every copy separate move and poke timers. A slow or rejected
+copy does not delay or stop the other copies. Intervals and the limiter come from
+Settings; restart an action after changing them. Copy moves use existing channels and the configured empty-channel
 fallback; they do not create temporary channels. The corresponding copy **Stop**
 items stop those actions while leaving the copies connected. **Remove my copies**
 and **HARD STOP** also stop the copy jobs. A changed recipient/server or disconnected
-copy stops its action rather than sending through another tab.
+copy stops that copy's affected action rather than sending through another tab.
+Losing the original connection stops all of its copy actions. Network/server processing
+can still affect arrival times; independent timers do not guarantee simultaneous delivery.
 
 ### HARD STOP and pending pokes
 
@@ -129,8 +134,9 @@ auto-poke-back, and signals all original/copy workers before waiting for them to
 finish. Old callbacks and open send dialogs cannot restart actions cancelled by
 that stop. A later explicit Start works normally.
 
-At most **8 plugin move/poke/message requests** can await server acknowledgement
-across timed actions, batches and reactions. This prevents maximum-speed mode from
+At most **8 plugin move/poke/message requests per connection** can await server
+acknowledgement, shared by that connection's actions, batches and reactions. Each
+copy has its own allowance, so a stalled copy does not block another. This prevents maximum-speed mode from
 building an unlimited queue of requests awaiting replies. Sending waits when the
 window is full, and stops if a request remains unanswered for five seconds while full. There is
 no retry or server-limit bypass.
@@ -248,7 +254,7 @@ Open **Settings...** for the move/poke intervals, message mode, and:
 
 In **Settings**, set seconds between moves and/or pokes to **`0`** for maximum
 speed. Stop and restart the corresponding action to apply a changed interval.
-Zero removes the plugin's timed pause, subject to the shared 8-request window;
+Zero removes the plugin's timed pause, subject to each connection's 8-request window;
 workers yield the CPU between rounds and
 check Stop between targets. Positive values support **`0.001` seconds** (1 ms).
 Positive waits use a high-resolution Windows timer when supported, with a fallback

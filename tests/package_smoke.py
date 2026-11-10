@@ -123,7 +123,7 @@ def main():
     with zipfile.ZipFile(ROOT / "dist/ts3-fun-plugin.ts3_plugin") as archive:
         assert archive.namelist() == ["package.ini", "plugins/funplugin_win64.dll"]
         assert archive.testzip() is None
-        assert b"Version = 2.17" in archive.read("package.ini")
+        assert b"Version = 2.18" in archive.read("package.ini")
         binary = archive.read("plugins/funplugin_win64.dll")
         assert binary == (ROOT / "funplugin_win64.dll").read_bytes()
 
@@ -145,7 +145,7 @@ def main():
         initialized = False
         try:
             dll.ts3plugin_version.restype = c.c_char_p
-            assert dll.ts3plugin_version() == b"2.17"
+            assert dll.ts3plugin_version() == b"2.18"
             assert dll.ts3plugin_apiVersion() == 26
             config = (temporary + "\\").encode("utf-8") + b"\0"
 

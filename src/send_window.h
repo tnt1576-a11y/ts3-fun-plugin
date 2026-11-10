@@ -7,7 +7,7 @@
 #include "ts3_functions.h"
 #include "teamspeak/public_errors.h"
 
-// Shared across timed jobs, batches and reactions. Never build an unlimited SDK queue.
+// Shared accounting, with an independent bounded window for each connection.
 class SendWindow {
     struct Pending { uint64 sch, started; std::string owner; };
     TS3Functions& api;
@@ -15,6 +15,11 @@ class SendWindow {
     CONDITION_VARIABLE changed;
     std::map<std::string, Pending> pending;
     std::atomic<uint64> generation{1};
+    size_t count(uint64 sch) const {
+        size_t n = 0;
+        for (const auto& item : pending) if (item.second.sch == sch) ++n;
+        return n;
+    }
 public:
     static const size_t capacity = 8;
     explicit SendWindow(TS3Functions& functions) : api(functions) {
@@ -22,6 +27,17 @@ public:
     }
     ~SendWindow() { DeleteCriticalSection(&lock); }
     uint64 epoch() const { return generation.load(); }
+    // An explicit Start may retry a previously timed-out connection.
+    void restartConnection(uint64 sch) {
+        EnterCriticalSection(&lock);
+        uint64 now = GetTickCount64();
+        for (auto it = pending.begin(); it != pending.end();) {
+            if (it->second.sch == sch && now - it->second.started >= 5000) it = pending.erase(it);
+            else ++it;
+        }
+        WakeAllConditionVariable(&changed);
+        LeaveCriticalSection(&lock);
+    }
     void cancelAll() {
         EnterCriticalSection(&lock);
         ++generation; pending.clear(); WakeAllConditionVariable(&changed);
@@ -43,14 +59,14 @@ public:
                       Cancelled cancelled, Submit submit) {
         if (!plugin || !api.createReturnCode) return ERROR_not_connected;
         EnterCriticalSection(&lock);
-        while (generation.load() == expectedEpoch && !cancelled() && pending.size() >= capacity) {
+        while (generation.load() == expectedEpoch && !cancelled() && count(sch) >= capacity) {
             uint64 now = GetTickCount64();
             bool timeout = false;
-            for (const auto& item : pending) if (now - item.second.started >= 5000) timeout = true;
+            for (const auto& item : pending)
+                if (item.second.sch == sch && now - item.second.started >= 5000) timeout = true;
             if (timeout) {
-                ++generation; pending.clear(); WakeAllConditionVariable(&changed);
                 LeaveCriticalSection(&lock);
-                if (api.printMessage) api.printMessage(sch, "[Fun Plugin] Sending stopped: no server acknowledgement for 5 seconds.", PLUGIN_MESSAGE_TARGET_SERVER);
+                if (api.printMessage) api.printMessage(sch, "[Fun Plugin] Sending stopped on this connection: no server acknowledgement for 5 seconds.", PLUGIN_MESSAGE_TARGET_SERVER);
                 return ERROR_not_connected;
             }
             SleepConditionVariableCS(&changed, &lock, 10);
