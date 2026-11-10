@@ -1,7 +1,12 @@
 /* SDK integration harness: no TeamSpeak server, network, or real config. */
 #include <cassert>
 #include <iostream>
+#include <atomic>
+#include <windows.h>
+static int WINAPI confirmCopyAction(HWND, LPCWSTR, LPCWSTR, UINT) { return IDYES; }
+#define MessageBoxW confirmCopyAction
 #include "../src/plugin.cpp"
+#undef MessageBoxW
 
 namespace {
 struct FakeConnection {
@@ -26,6 +31,37 @@ int activations = 0, deviceCloses = 0;
 Copies::Manager* duringOpen = nullptr;
 bool stopDuringOpen = false;
 bool delayDisconnect = false;
+std::atomic<int> copyPokes{0}, copyMoves{0};
+std::vector<uint64> actionSenders;
+unsigned int serverIdentityFake(uint64, size_t, char** result) { *result = _strdup("test-server"); return ERROR_ok; }
+unsigned int clientIdentityFake(uint64, anyID client, size_t, char** result) {
+    assert(client == 77); *result = _strdup("test-target"); return ERROR_ok;
+}
+void codeFake(const char*, char* result, size_t size) {
+    static std::atomic<int> serial{0}; snprintf(result, size, "copy-action-%d", ++serial);
+}
+unsigned int pokeActionFake(uint64 sch, anyID target, const char*, const char* code) {
+    assert(target == 77 && (sch == 100 || sch == 101));
+    EnterCriticalSection(&cs); actionSenders.push_back(sch); LeaveCriticalSection(&cs);
+    ++copyPokes; ts3plugin_onServerErrorEvent(sch, "", ERROR_ok, code, ""); return ERROR_ok;
+}
+unsigned int moveActionFake(uint64 sch, anyID target, uint64, const char*, const char* code) {
+    assert(target == 77 && (sch == 100 || sch == 101));
+    EnterCriticalSection(&cs); actionSenders.push_back(sch); LeaveCriticalSection(&cs);
+    ++copyMoves; ts3plugin_onServerErrorEvent(sch, "", ERROR_ok, code, ""); return ERROR_ok;
+}
+unsigned int channelListFake(uint64, uint64** result) {
+    *result = (uint64*)calloc(4, sizeof(uint64)); (*result)[0] = 11; (*result)[1] = 12; (*result)[2] = 13; return ERROR_ok;
+}
+unsigned int channelMembersFake(uint64, uint64, anyID** result) {
+    *result = (anyID*)calloc(1, sizeof(anyID)); return ERROR_ok;
+}
+void waitActions(bool poke, bool move) {
+    uint64 deadline = GetTickCount64() + 3000;
+    while ((poke && copyPokes.load() < 2) || (move && copyMoves.load() < 2)) {
+        assert(GetTickCount64() < deadline); Sleep(1);
+    }
+}
 
 unsigned int freeFake(void* value) { free(value); return ERROR_ok; }
 void printFake(uint64, const char* message, PluginMessageTarget) { messages.emplace_back(message); }
@@ -158,6 +194,9 @@ int main() {
     api.activateCaptureDevice = activateFake; api.getClientID = clientFake;
     api.getChannelOfClient = channelFake; api.stopConnection = stopFake;
     api.guiConnect = connectFake; api.getConfigPath = configFake;
+    api.getServerVariableAsString = serverIdentityFake; api.getClientVariableAsString = clientIdentityFake;
+    api.createReturnCode = codeFake; api.requestClientPoke = pokeActionFake; api.requestClientMove = moveActionFake;
+    api.getChannelList = channelListFake; api.getChannelClientList = channelMembersFake;
     ts3plugin_setFunctionPointers(api);
 
     int count = 0;
@@ -376,7 +415,7 @@ int main() {
     ts3plugin_initMenus(&menus, &icon);
     int menuCount = 0;
     for (; menus[menuCount]; ++menuCount) free(menus[menuCount]);
-    free(menus); assert(menuCount == 28);
+    free(menus); assert(menuCount == 34);
     assert(FindResourceW(hInstance, MAKEINTRESOURCEW(IDD_COPIES), MAKEINTRESOURCEW(5)));
     g.selfLockOn = 1; selfLock = 1; selfLockSch = 1; selfLockChannel = 9;
     assert(g_copies->start(request(1), GetTickCount64()));
@@ -387,8 +426,35 @@ int main() {
     connections.at(100).status = STATUS_CONNECTION_ESTABLISHED;
     ts3plugin_onConnectStatusChangeEvent(100, STATUS_CONNECTION_ESTABLISHED, ERROR_ok);
     pump(); assert(selfLockSch == 1 && g_copies->count() == 1 && focused == 1);
+    assert(g_copies->start(request(1), GetTickCount64()));
+    g_copies->tick(GetTickCount64());
+    establish(*g_copies, 101, GetTickCount64());
+    pump(); assert(g_copies->senders(1).size() == 2);
+    ts3plugin_registerPluginID("copy-actions-test");
+    g.moveIntervalMs = g.pokeDelayMs = 1;
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_START, 77);
+    waitActions(true, false);
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_STOP, 77);
+    assert(!copyPokeJob.thread && !pokeJob.thread);
+    assert(std::find(actionSenders.begin(), actionSenders.end(), 100) != actionSenders.end());
+    assert(std::find(actionSenders.begin(), actionSenders.end(), 101) != actionSenders.end());
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_MOVE_START, 77);
+    waitActions(false, true);
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_MOVE_STOP, 77);
+    assert(!copyMoveJob.thread && !moveJob.thread);
+    copyPokes = copyMoves = 0;
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_START, 77);
+    waitActions(true, true);
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_STOP, 77);
+    assert(!copyMoveJob.thread && !copyPokeJob.thread);
+    copyPokes = copyMoves = 0;
+    ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_START, 77);
+    waitActions(true, true);
     ts3plugin_onMenuItemEvent(1, PLUGIN_MENU_TYPE_GLOBAL, MENU_HARDSTOP, 0);
-    assert(stops.size() == 1 && closed.size() == 1 && !g_copies->busy() && selfLockSch == 1);
+    assert(!copyMoveJob.thread && !copyPokeJob.thread && !actionSenders.empty());
+    int finishedPokes = copyPokes, finishedMoves = copyMoves;
+    Sleep(30); assert(copyPokes == finishedPokes && copyMoves == finishedMoves);
+    assert(stops.size() == 2 && closed.size() == 2 && !g_copies->busy() && selfLockSch == 1);
     ts3plugin_onConnectStatusChangeEvent(100, STATUS_DISCONNECTED, ERROR_ok);
     pump(); assert(!isCopyConnection(100));
     ts3plugin_shutdown(); assert(!g_copyWindow && !g_copies);

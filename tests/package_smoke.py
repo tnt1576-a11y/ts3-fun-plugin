@@ -19,7 +19,7 @@ gdi = c.WinDLL("gdi32", use_last_error=True)
 DialogProc = c.WINFUNCTYPE(c.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
 
 
-def inspect_dialog(dll, preview, resource=101, channel=False):
+def inspect_dialog(dll, preview, resource=101, channel=False, copies=False):
     user.CreateDialogParamW.argtypes = [w.HINSTANCE, w.LPCWSTR, w.HWND, DialogProc, w.LPARAM]
     user.CreateDialogParamW.restype = w.HWND
     user.GetDlgItem.argtypes = [w.HWND, c.c_int]
@@ -50,6 +50,10 @@ def inspect_dialog(dll, preview, resource=101, channel=False):
                         (1223, "Send this many pokes immediately, without the Settings timer.\nHARD STOP cancels requests that have not been submitted."))}[resource]
         for control, value in values:
             assert user.SetDlgItemTextW(window, control, value)
+        if copies:
+            assert user.SetWindowTextW(window, "Fun Plugin - Message from my copies")
+            assert user.SetDlgItemTextW(window, 1221, "7")
+            assert user.SetDlgItemTextW(window, 1223, "3 connected copies. Amount is PER COPY.\nYour original tab is not a sender.")
         if channel:
             assert user.SetWindowTextW(window, "Fun Plugin - Channel Talk Back")
             assert user.SetDlgItemTextW(window, 1210, "Lobby / Party channel")
@@ -101,6 +105,8 @@ def inspect_dialog(dll, preview, resource=101, channel=False):
                 assert gdi.GetDIBits(memory, bitmap, 0, height, pixels, c.byref(info), 0)
                 assert len(set(pixels.raw)) > 8, "Dialog preview is blank"
                 name = "settings-dialog" if resource == 100 else "direct-send-dialog" if resource == 103 else "copies-dialog" if resource == 101 else "channel-talk-back-dialog" if channel else "talk-back-dialog"
+                if copies:
+                    name = "copy-send-dialog"
                 output = ROOT / f"tests/bin/{name}.png"
                 output.parent.mkdir(exist_ok=True)
                 Image.frombytes("RGB", (width, height), pixels.raw, "raw", "BGRX").save(output)
@@ -117,7 +123,7 @@ def main():
     with zipfile.ZipFile(ROOT / "dist/ts3-fun-plugin.ts3_plugin") as archive:
         assert archive.namelist() == ["package.ini", "plugins/funplugin_win64.dll"]
         assert archive.testzip() is None
-        assert b"Version = 2.16" in archive.read("package.ini")
+        assert b"Version = 2.17" in archive.read("package.ini")
         binary = archive.read("plugins/funplugin_win64.dll")
         assert binary == (ROOT / "funplugin_win64.dll").read_bytes()
 
@@ -139,7 +145,7 @@ def main():
         initialized = False
         try:
             dll.ts3plugin_version.restype = c.c_char_p
-            assert dll.ts3plugin_version() == b"2.16"
+            assert dll.ts3plugin_version() == b"2.17"
             assert dll.ts3plugin_apiVersion() == 26
             config = (temporary + "\\").encode("utf-8") + b"\0"
 
@@ -160,13 +166,16 @@ def main():
             dll.ts3plugin_freeMemory.argtypes = [c.c_void_p]
             dll.ts3plugin_initMenus(c.byref(menus), c.byref(icon))
             labels = []
-            for i in range(29):
+            for i in range(35):
                 if not menus[i]:
                     break
                 labels.append(menus[i].contents.text.decode())
                 dll.ts3plugin_freeMemory(menus[i])
             dll.ts3plugin_freeMemory(menus)
-            assert len(labels) == 28
+            assert len(labels) == 34
+            for action in ("Poke", "Random Move", "Chaos"):
+                assert f"{action} from copies: Start..." in labels
+                assert f"{action} from copies: Stop" in labels
             assert "Poke Pack..." in labels
             assert "Poke from my copies..." in labels
             assert "Message from my copies..." in labels
@@ -182,13 +191,14 @@ def main():
             inspect_dialog(dll, "--preview" in sys.argv, 102)
             inspect_dialog(dll, "--preview" in sys.argv, 102, channel=True)
             inspect_dialog(dll, "--preview" in sys.argv, 103)
+            inspect_dialog(dll, "--preview" in sys.argv, 103, copies=True)
             inspect_dialog(dll, "--preview" in sys.argv, 100)
         finally:
             if initialized:
                 dll.ts3plugin_shutdown()
             kernel.FreeLibrary.argtypes = [w.HMODULE]
             assert kernel.FreeLibrary(dll._handle)
-    print("PASS: exact packaged DLL loads, API/version, lifecycle, 28 menus, audio exports, native dialogs, archive integrity")
+    print("PASS: exact packaged DLL loads, API/version, lifecycle, 34 menus, audio exports, native dialogs, archive integrity")
     print("DLL SHA-256:", hashlib.sha256(binary).hexdigest())
 
 

@@ -49,12 +49,13 @@
 /* ------------------------------------------------------------------ */
 
 static struct TS3Functions ts3Functions;   /* filled in by setFunctionPointers */
-static DirectSend::Batch g_directSend(ts3Functions);
+static SendWindow g_sendWindow(ts3Functions);
+static DirectSend::Batch g_directSend(ts3Functions, g_sendWindow);
 static char*     pluginID  = NULL;          /* our registered plugin id         */
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.16"
+#define PLUGIN_VERSION "2.17"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
@@ -87,7 +88,10 @@ enum {
     MENU_TALKBACK_CHANNEL_HERE,
     MENU_POKE_PACK,
     MENU_COPIES_POKE,
-    MENU_COPIES_MESSAGE
+    MENU_COPIES_MESSAGE,
+    MENU_COPIES_POKE_START, MENU_COPIES_POKE_STOP,
+    MENU_COPIES_MOVE_START, MENU_COPIES_MOVE_STOP,
+    MENU_COPIES_CHAOS_START, MENU_COPIES_CHAOS_STOP
 };
 
 /* "No empty channel" behaviour */
@@ -237,6 +241,7 @@ static volatile LONG g_kickFlag = 0;         /* set when I was kicked from the S
 /* Delayed-reaction plumbing (so talk reactions can wait a beat) */
 static HANDLE        g_shutdownEvent = NULL;   /* signalled on shutdown to cancel pending */
 static volatile LONG g_pending = 0;            /* outstanding delayed-reaction threads    */
+static std::atomic<int> g_reactionsPending{0};
 
 static void setDefaults() {
     g.moveIntervalMs   = 5000;
@@ -398,17 +403,22 @@ static std::string pickPokeMessage() {
     return result;
 }
 
-static void pokeTimes(uint64 sch, anyID target, int times) {
-    for (int i = 0; i < times; ++i) {
+static void pokeTimes(uint64 sch, anyID target, int times, uint64 epoch) {
+    for (int i = 0; i < times && g_sendWindow.epoch() == epoch; ++i) {
         std::string m = pickPokeMessage();
-        ts3Functions.requestClientPoke(sch, target, m.c_str(), NULL);
+        unsigned int error = g_sendWindow.send(epoch, sch, "reaction", pluginID, [] { return false; },
+            [&](const char* code) { return ts3Functions.requestClientPoke(sch, target, m.c_str(), code); });
+        if (error != ERROR_ok && error != ERROR_ok_no_update) break;
     }
 }
 
 /* poke a fixed message N times (used by talk-poke's dedicated text) */
-static void pokeTimesMsg(uint64 sch, anyID target, int times, const char* msg) {
-    for (int i = 0; i < times; ++i)
-        ts3Functions.requestClientPoke(sch, target, msg, NULL);
+static void pokeTimesMsg(uint64 sch, anyID target, int times, const char* msg, uint64 epoch) {
+    for (int i = 0; i < times && g_sendWindow.epoch() == epoch; ++i) {
+        unsigned int error = g_sendWindow.send(epoch, sch, "reaction", pluginID, [] { return false; },
+            [&](const char* code) { return ts3Functions.requestClientPoke(sch, target, msg, code); });
+        if (error != ERROR_ok && error != ERROR_ok_no_update) break;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,10 +438,18 @@ struct Job {
     std::string returnCode;
     std::map<anyID, uint64> lastDestination; // Avoid identical queued moves before cache updates.
     std::map<anyID, uint64> lastMoveAt;
+    uint64 epoch = 0;
+    DWORD startedAt = 0;
+    std::vector<uint64> senders; // Empty = original tab. Otherwise a frozen copy list.
+    std::string serverUID, targetUID;
 };
 
 static Job moveJob;
 static Job pokeJob;
+static Job copyMoveJob;
+static Job copyPokeJob;
+
+static void signalJob(Job& j) { if (j.stopEvent) SetEvent(j.stopEvent); }
 
 static void stopJob(Job& j) {
     EnterCriticalSection(&cs);
@@ -466,6 +484,8 @@ static void launchJob(Job& j, LPTHREAD_START_ROUTINE fn) {
     char code[128] = {};
     if (pluginID && ts3Functions.createReturnCode) ts3Functions.createReturnCode(pluginID, code, sizeof(code));
     j.returnCode = code;
+    j.epoch = g_sendWindow.epoch();
+    j.startedAt = GetTickCount();
     InterlockedExchange(&j.active, 1);
     j.thread = j.stopEvent ? CreateThread(NULL, 0, fn, &j, 0, NULL) : NULL;
     LeaveCriticalSection(&cs);
@@ -474,6 +494,13 @@ static void launchJob(Job& j, LPTHREAD_START_ROUTINE fn) {
 
 /* interruptible sleep; returns true if we were told to stop */
 static bool sleepOrStop(Job* j, int ms) {
+    bool stopOnTimeout = false;
+    if (j->limiterMs > 0) {
+        DWORD elapsed = GetTickCount() - j->startedAt;
+        if (elapsed >= (DWORD)j->limiterMs) return true;
+        int remaining = j->limiterMs - (int)elapsed;
+        if (ms >= remaining) { ms = remaining; stopOnTimeout = true; }
+    }
     if (ms <= 0) {
         SwitchToThread(); // Yield the CPU without a timed delay.
         return WaitForSingleObject(j->stopEvent, 0) != WAIT_TIMEOUT;
@@ -482,13 +509,17 @@ static bool sleepOrStop(Job* j, int ms) {
     due.QuadPart = -(LONGLONG)ms * 10000;
     if (j->delayTimer && SetWaitableTimer(j->delayTimer, &due, 0, NULL, NULL, FALSE)) {
         HANDLE handles[] = {j->stopEvent, j->delayTimer};
-        return WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0 + 1;
+        DWORD result = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        return stopOnTimeout || result != WAIT_OBJECT_0 + 1;
     }
-    return WaitForSingleObject(j->stopEvent, ms) != WAIT_TIMEOUT;
+    DWORD result = WaitForSingleObject(j->stopEvent, ms);
+    return stopOnTimeout || result != WAIT_TIMEOUT;
 }
 
 static bool jobStopped(Job* j) {
-    return j->stopEvent && WaitForSingleObject(j->stopEvent, 0) != WAIT_TIMEOUT;
+    return (j->epoch && j->epoch != g_sendWindow.epoch()) ||
+           (j->limiterMs > 0 && (DWORD)(GetTickCount() - j->startedAt) >= (DWORD)j->limiterMs) ||
+           (j->stopEvent && WaitForSingleObject(j->stopEvent, 0) != WAIT_TIMEOUT);
 }
 
 static bool jobRequest(Job* j, unsigned int error) {
@@ -500,8 +531,9 @@ static bool jobRequest(Job* j, unsigned int error) {
 static void jobReply(uint64 sch, const char* code, unsigned int error) {
     if (!code || error == ERROR_ok || error == ERROR_ok_no_update) return;
     EnterCriticalSection(&cs);
-    for (Job* job : {&moveJob, &pokeJob})
-        if (job->sch == sch && !job->returnCode.empty() && job->returnCode == code && job->stopEvent)
+    for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob})
+        if ((job->sch == sch || std::find(job->senders.begin(), job->senders.end(), sch) != job->senders.end()) &&
+            !job->returnCode.empty() && job->returnCode == code && job->stopEvent)
             SetEvent(job->stopEvent);
     LeaveCriticalSection(&cs);
 }
@@ -689,10 +721,33 @@ static uint64 pendingDestination(Job* j, anyID target, uint64 current) {
     return last->second;
 }
 
-static bool doOneMove(Job* j) {
+static bool validCopySender(Job* j, uint64 sender) {
+    if (j->senders.empty()) return true;
+    for (uint64 connection : {j->sch, sender}) {
+        int status = STATUS_DISCONNECTED;
+        if (ts3Functions.getConnectionStatus(connection, &status) != ERROR_ok || status != STATUS_CONNECTION_ESTABLISHED ||
+            DirectSend::identity(ts3Functions, connection) != j->serverUID ||
+            DirectSend::identity(ts3Functions, connection, j->targets.front()) != j->targetUID) {
+            signalJob(*j); return false;
+        }
+    }
+    return true;
+}
+
+static bool sendMove(Job* j, uint64 sender, anyID target, uint64 destination) {
+    return jobRequest(j, g_sendWindow.send(j->epoch, sender, j->returnCode, pluginID,
+        [&] { return jobStopped(j); }, [&](const char* code) {
+            if (!validCopySender(j, sender)) return (unsigned int)ERROR_client_invalid_id;
+            return ts3Functions.requestClientMove(sender, target, destination, "", code);
+        }));
+}
+
+static bool doOneMove(Job* j, uint64 sender = 0) {
+    if (!sender) sender = j->sch;
+    if (jobStopped(j) || !validCopySender(j, sender)) return false;
     bool sent = false;
     EnterCriticalSection(&cs);
-    bool usePool = g.autoCreateTemp != 0;
+    bool usePool = g.autoCreateTemp != 0 && j->senders.empty();
     LeaveCriticalSection(&cs);
     /* Pool mode: move only among the channels we created. */
     if (usePool) {
@@ -705,7 +760,7 @@ static bool doOneMove(Job* j) {
             if (jobStopped(j)) break;
             anyID target = j->targets[t];
             uint64 cur = 0;
-            ts3Functions.getChannelOfClient(j->sch, target, &cur);
+            ts3Functions.getChannelOfClient(sender, target, &cur);
             uint64 pending = pendingDestination(j, target, cur);
             uint64 dest = 0;
             size_t offset = rand() % pool.size();
@@ -714,7 +769,7 @@ static bool doOneMove(Job* j) {
                 if (c != cur && c != pending) { dest = c; break; }
             }
             if (dest) {
-                if (!jobRequest(j, ts3Functions.requestClientMove(j->sch, target, dest, "", j->returnCode.empty() ? NULL : j->returnCode.c_str()))) break;
+                if (!sendMove(j, sender, target, dest)) break;
                 j->lastDestination[target] = dest;
                 j->lastMoveAt[target] = GetTickCount64();
                 sent = true;
@@ -724,7 +779,7 @@ static bool doOneMove(Job* j) {
     }
 
     uint64* channels = NULL;
-    if (ts3Functions.getChannelList(j->sch, &channels) != ERROR_ok || !channels) return false;
+    if (ts3Functions.getChannelList(sender, &channels) != ERROR_ok || !channels) return false;
 
     std::vector<uint64> empties;  /* consumed as we go so a group spreads out */
     std::vector<uint64> all;
@@ -733,7 +788,7 @@ static bool doOneMove(Job* j) {
         uint64 ch = channels[i];
         all.push_back(ch);
         anyID* cl = NULL;
-        if (ts3Functions.getChannelClientList(j->sch, ch, &cl) == ERROR_ok && cl) {
+        if (ts3Functions.getChannelClientList(sender, ch, &cl) == ERROR_ok && cl) {
             if (cl[0] == 0) empties.push_back(ch);
             ts3Functions.freeMemory(cl);
         }
@@ -744,7 +799,7 @@ static bool doOneMove(Job* j) {
         if (jobStopped(j)) break;
         anyID target = j->targets[t];
         uint64 cur = 0;
-        ts3Functions.getChannelOfClient(j->sch, target, &cur);
+        ts3Functions.getChannelOfClient(sender, target, &cur);
         uint64 pending = pendingDestination(j, target, cur);
 
         uint64 dest = 0;
@@ -770,7 +825,7 @@ static bool doOneMove(Job* j) {
         }
 
         if (dest) {
-            if (!jobRequest(j, ts3Functions.requestClientMove(j->sch, target, dest, "", j->returnCode.empty() ? NULL : j->returnCode.c_str()))) break;
+            if (!sendMove(j, sender, target, dest)) break;
             j->lastDestination[target] = dest;
             j->lastMoveAt[target] = GetTickCount64();
             sent = true;
@@ -779,11 +834,17 @@ static bool doOneMove(Job* j) {
     return sent;
 }
 
-static void doOnePoke(Job* j) {
+static void doOnePoke(Job* j, uint64 sender = 0) {
+    if (!sender) sender = j->sch;
+    if (jobStopped(j) || !validCopySender(j, sender)) return;
     for (size_t i = 0; i < j->targets.size(); ++i) {
         if (jobStopped(j)) break;
         std::string m = pickPokeMessage();
-        if (!jobRequest(j, ts3Functions.requestClientPoke(j->sch, j->targets[i], m.c_str(), j->returnCode.empty() ? NULL : j->returnCode.c_str()))) break;
+        if (!jobRequest(j, g_sendWindow.send(j->epoch, sender, j->returnCode, pluginID,
+            [&] { return jobStopped(j); }, [&](const char* code) {
+                if (!validCopySender(j, sender)) return (unsigned int)ERROR_client_invalid_id;
+                return ts3Functions.requestClientPoke(sender, j->targets[i], m.c_str(), code);
+            }))) break;
     }
 }
 
@@ -792,7 +853,12 @@ static DWORD WINAPI moveThread(LPVOID p) {
     srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)j);
     DWORD start = GetTickCount();
     while (!jobStopped(j)) {
-        bool sent = doOneMove(j);
+        bool sent = false;
+        if (j->senders.empty()) sent = doOneMove(j);
+        else for (uint64 sender : j->senders) {
+            if (jobStopped(j)) break;
+            sent = doOneMove(j, sender) || sent;
+        }
         if (limitReached(j, start)) break;
         if (sleepOrStop(j, sent ? j->intervalMs : (std::max)(10, j->intervalMs))) break;
         if (limitReached(j, start)) break;
@@ -806,7 +872,11 @@ static DWORD WINAPI pokeThread(LPVOID p) {
     srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)j);
     DWORD start = GetTickCount();
     while (!jobStopped(j)) {
-        doOnePoke(j);
+        if (j->senders.empty()) doOnePoke(j);
+        else for (uint64 sender : j->senders) {
+            if (jobStopped(j)) break;
+            doOnePoke(j, sender);
+        }
         if (limitReached(j, start)) break;
         if (sleepOrStop(j, j->intervalMs)) break;
         if (limitReached(j, start)) break;
@@ -869,12 +939,70 @@ static void stopMove() {
 }
 static void stopPoke() { stopJob(pokeJob); }
 
+static void stopCopyJobs() {
+    EnterCriticalSection(&cs);
+    signalJob(copyMoveJob); signalJob(copyPokeJob);
+    LeaveCriticalSection(&cs);
+    stopJob(copyMoveJob); stopJob(copyPokeJob);
+}
+
+static void startCopyActions(uint64 sch, anyID target, bool move, bool poke) {
+    uint64 epoch = g_sendWindow.epoch();
+    int state = STATUS_DISCONNECTED;
+    if (isCopyConnection(sch) || !g_copies || ts3Functions.getConnectionStatus(sch, &state) != ERROR_ok ||
+        state != STATUS_CONNECTION_ESTABLISHED) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Start copy actions from the original connected tab."); return;
+    }
+    auto senders = g_copies->senders(sch);
+    if (senders.empty()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] No connected copies belong to this tab."); return;
+    }
+    std::string serverUID = DirectSend::identity(ts3Functions, sch);
+    std::string targetUID = target ? DirectSend::identity(ts3Functions, sch, target) : "";
+    if (serverUID.empty() || targetUID.empty()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Cannot identify this server or recipient."); return;
+    }
+    int allMode = g.noEmptyMode == NE_ALL;
+    if (move && g.noEmptyMode == NE_ASK && !hasAnyEmptyChannel(sch)) {
+        if (MessageBoxW(GetForegroundWindow(), L"No empty channels are available. Move among all existing channels?",
+                        L"Move from copies", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+        allMode = 1;
+    }
+    std::wstring warning = L"Start " + std::wstring(move && poke ? L"Chaos" : move ? L"Random Move" : L"Poke") +
+        L" from " + std::to_wstring(senders.size()) + L" connected copies?\n\nUses your Settings intervals and limiter. "
+        L"Moves use existing channels. Your original tab will not send.\n\nUse only on your own server with the recipient's agreement. "
+        L"Server limits apply. HARD STOP stops all copies and pending actions.";
+    if (MessageBoxW(GetForegroundWindow(), warning.c_str(), L"Start actions from my copies", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    if (epoch != g_sendWindow.epoch()) return;
+    auto ready = g_copies->senders(sch);
+    for (uint64 sender : senders) if (std::find(ready.begin(), ready.end(), sender) == ready.end()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Copies changed. Open the action again."); return;
+    }
+    for (Job* job : {move ? &copyMoveJob : nullptr, poke ? &copyPokeJob : nullptr}) {
+        if (!job) continue;
+        stopJob(*job);
+        EnterCriticalSection(&cs);
+        job->sch = sch; job->targets = {target}; job->senders = senders;
+        job->serverUID = serverUID; job->targetUID = targetUID;
+        job->allChannels = allMode;
+        job->intervalMs = job == &copyMoveJob ? g.moveIntervalMs : g.pokeDelayMs;
+        job->limiterMs = (int)((std::min)((uint64)(std::max)(0, g.limiterSec) * 1000, (uint64)INT_MAX));
+        LeaveCriticalSection(&cs);
+        launchJob(*job, job == &copyMoveJob ? moveThread : pokeThread);
+    }
+}
+
 /* Stop the timed jobs only (used by Chaos: Stop and by shutdown). */
 static void stopAllJobs() {
     uint64 sch;
     sch = moveJob.sch;
+    EnterCriticalSection(&cs);
+    for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob}) signalJob(*job);
+    LeaveCriticalSection(&cs);
     stopJob(moveJob);
     stopJob(pokeJob);
+    stopJob(copyMoveJob);
+    stopJob(copyPokeJob);
     deleteTempChannels(sch);   /* remove our pool channels (no-op if none) */
 }
 
@@ -882,18 +1010,21 @@ static void stopAllJobs() {
  * Auto-poke-back is turned off for the session (re-enable it in Settings);
  * all talk-poke arming is cleared. */
 static void hardStop() {
-    g_directSend.stop();
-    stopTalkBack();
-    if (g_copies) g_copies->stopAll();
-    stopAllJobs();
     EnterCriticalSection(&cs);
+    g_sendWindow.cancelAll();
     talkTargets.clear();      /* disarm every talk-poke target */
     talkMoveTargets.clear();  /* disarm every talk-move target */
     g.autoPokeBack = 0;       /* stop reacting to incoming pokes */
+    for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob}) signalJob(*job);
     LeaveCriticalSection(&cs);
+    g_directSend.stop();
+    stopAllJobs();
+    while (g_reactionsPending.load()) Sleep(1);
+    stopTalkBack();
+    if (g_copies) g_copies->stopAll();
     ts3Functions.printMessageToCurrentTab(
         "[Fun Plugin] HARD STOP: copy queue cancelled and copies disconnected; all jobs stopped, "
-        "Talk Back stopped, talk-poke/talk-move disarmed, auto-poke-back turned off.");
+        "Talk Back stopped, pending reactions cancelled, auto-poke-back off. Already delivered pokes cannot be recalled.");
 }
 
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
@@ -903,6 +1034,7 @@ static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
 /* ------------------------------------------------------------------ */
 
 struct DelayedReaction {
+    uint64 epoch;
     uint64 sch;
     anyID  client;
     int    delayMs;
@@ -912,14 +1044,18 @@ struct DelayedReaction {
 
 static DWORD WINAPI reactionThread(LPVOID p) {
     DelayedReaction* d = (DelayedReaction*)p;
-    /* wait out the delay, but bail immediately if the plugin is shutting down */
-    if (WaitForSingleObject(g_shutdownEvent, d->delayMs) == WAIT_TIMEOUT) {
+    uint64 deadline = GetTickCount64() + (uint64)(std::max)(0, d->delayMs);
+    while (d->epoch == g_sendWindow.epoch() && GetTickCount64() < deadline) {
+        if (WaitForSingleObject(g_shutdownEvent, (DWORD)(std::min)(deadline - GetTickCount64(), (uint64)20)) == WAIT_OBJECT_0) break;
+    }
+    if (d->epoch == g_sendWindow.epoch() && WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0) {
         if (d->doPoke) {
-            if (d->useMsg) pokeTimesMsg(d->sch, d->client, d->pokeN, d->msg);
-            else           pokeTimes(d->sch, d->client, d->pokeN);
+            if (d->useMsg) pokeTimesMsg(d->sch, d->client, d->pokeN, d->msg, d->epoch);
+            else           pokeTimes(d->sch, d->client, d->pokeN, d->epoch);
         }
         if (d->doMove) {
             Job tmp{};
+            tmp.epoch = d->epoch;
             tmp.sch = d->sch;
             tmp.targets.push_back(d->client);
             tmp.allChannels = d->moveAll;
@@ -928,16 +1064,21 @@ static DWORD WINAPI reactionThread(LPVOID p) {
     }
     free(d);
     InterlockedDecrement(&g_pending);
+    --g_reactionsPending;
     return 0;
 }
 
 static void scheduleReaction(const DelayedReaction& src) {
+    EnterCriticalSection(&cs);
+    if (src.epoch != g_sendWindow.epoch()) { LeaveCriticalSection(&cs); return; }
     DelayedReaction* d = (DelayedReaction*)malloc(sizeof(DelayedReaction));
     *d = src;
     InterlockedIncrement(&g_pending);
+    ++g_reactionsPending;
     HANDLE h = CreateThread(NULL, 0, reactionThread, d, 0, NULL);
     if (h) CloseHandle(h);
-    else { InterlockedDecrement(&g_pending); free(d); }
+    else { InterlockedDecrement(&g_pending); --g_reactionsPending; free(d); }
+    LeaveCriticalSection(&cs);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1263,12 +1404,11 @@ static INT_PTR CALLBACK directSendProc(HWND dialog, UINT message, WPARAM wParam,
             : L"Fun Plugin - Poke Pack");
         SetDlgItemTextW(dialog, IDC_SEND_TARGET, data->name.c_str());
         setDlgInt(dialog, IDC_SEND_COUNT, data->copies ? 1 : 5);
-        EnableWindow(GetDlgItem(dialog, IDC_SEND_COUNT), !data->copies);
         SendDlgItemMessageW(dialog, IDC_SEND_COUNT, EM_SETLIMITTEXT, 10, 0);
         SendDlgItemMessageW(dialog, IDC_SEND_TEXT, EM_SETLIMITTEXT, TS3_MAX_SIZE_TEXTMESSAGE, 0);
         SetDlgItemTextW(dialog, IDC_SEND_TEXT, copyWide(data->request.text).c_str());
         std::wstring detail = data->copies
-            ? std::to_wstring(data->request.senders.size()) + L" connected copies: one send from each.\nYour original tab is not a sender."
+            ? std::to_wstring(data->request.senders.size()) + L" connected copies. Amount is PER COPY.\nYour original tab is not a sender."
             : L"Send this many pokes immediately, without the Settings timer.\nHARD STOP cancels requests that have not been submitted.";
         SetDlgItemTextW(dialog, IDC_SEND_HELP, detail.c_str());
         return TRUE;
@@ -1278,7 +1418,6 @@ static INT_PTR CALLBACK directSendProc(HWND dialog, UINT message, WPARAM wParam,
             MessageBoxW(dialog, L"Enter a whole number from 1 to 2147483647.", L"Poke Pack amount", MB_OK | MB_ICONINFORMATION);
             return TRUE;
         }
-        if (data->copies) data->request.count = 1;
         data->request.text = copyField(dialog, IDC_SEND_TEXT);
         const size_t limit = data->request.privateMessage ? TS3_MAX_SIZE_TEXTMESSAGE : 100;
         if (data->request.text.empty() || data->request.text.size() > limit) {
@@ -1305,6 +1444,7 @@ static INT_PTR CALLBACK directSendProc(HWND dialog, UINT message, WPARAM wParam,
 }
 
 static void openDirectSend(uint64 sch, anyID target, bool copies, bool privateMessage) {
+    uint64 epoch = g_sendWindow.epoch();
     if (g_directSend.busy()) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] A send is already running. HARD STOP cancels it.");
         return;
@@ -1340,6 +1480,7 @@ static void openDirectSend(uint64 sch, anyID target, bool copies, bool privateMe
     data.request.text = privateMessage ? "" : pickPokeMessage();
     if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_DIRECT_SEND), GetForegroundWindow(),
                         directSendProc, (LPARAM)&data) != IDOK) return;
+    if (epoch != g_sendWindow.epoch()) return;
     // Modal dialogs pump events: copies may have been removed while it was open.
     if (copies) {
         const auto ready = g_copies ? g_copies->senders(sch) : std::vector<uint64>();
@@ -1563,6 +1704,8 @@ int ts3plugin_init() {
 }
 
 void ts3plugin_shutdown() {
+    g_sendWindow.cancelAll();
+    stopAllJobs();
     g_directSend.stop();
     InterlockedExchange(&selfLock, 0);
     g_talkAudio.mute();
@@ -1629,7 +1772,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 28;
+    const int count = 34;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -1640,6 +1783,12 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_POKE_PACK,      "Poke Pack...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_COPIES_POKE,    "Poke from my copies...");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_COPIES_MESSAGE, "Message from my copies...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_START, "Poke from copies: Start...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_POKE_STOP, "Poke from copies: Stop");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_MOVE_START, "Random Move from copies: Start...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_MOVE_STOP, "Random Move from copies: Stop");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_START, "Chaos from copies: Start...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT, MENU_COPIES_CHAOS_STOP, "Chaos from copies: Stop");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_CHAOS_START,    "Chaos (move + poke): Start");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_CHAOS_STOP,     "Chaos (move + poke): Stop");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_CLIENT,  MENU_TALKPOKE_START, "Talk-poke: Arm");
@@ -1674,6 +1823,15 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
     uint64 channelTarget = selectedItemID;          /* CHANNEL menus */
 
     switch (menuItemID) {
+    case MENU_COPIES_POKE_START:
+    case MENU_COPIES_MOVE_START:
+    case MENU_COPIES_CHAOS_START:
+        if (type == PLUGIN_MENU_TYPE_CLIENT)
+            startCopyActions(serverConnectionHandlerID, clientTarget, menuItemID != MENU_COPIES_POKE_START, menuItemID != MENU_COPIES_MOVE_START);
+        break;
+    case MENU_COPIES_POKE_STOP: stopJob(copyPokeJob); break;
+    case MENU_COPIES_MOVE_STOP: stopJob(copyMoveJob); break;
+    case MENU_COPIES_CHAOS_STOP: stopCopyJobs(); break;
     case MENU_POKE_PACK:
     case MENU_COPIES_POKE:
     case MENU_COPIES_MESSAGE:
@@ -1776,6 +1934,7 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         if (type == PLUGIN_MENU_TYPE_CHANNEL) openCopies(serverConnectionHandlerID, channelTarget);
         break;
     case MENU_COPIES_REMOVE:
+        stopCopyJobs();
         g_directSend.stop();
         if (g_copies) g_copies->stopAll();
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Copy queue cancelled; disconnecting plugin-created copies.");
@@ -1822,19 +1981,23 @@ int ts3plugin_onClientPokeEvent(uint64 serverConnectionHandlerID, anyID fromClie
     (void)pokerName; (void)pokerUniqueIdentity; (void)message; (void)ffIgnored;
     if (isCopyConnection(serverConnectionHandlerID) || g_copyOpening) return 0;
 
+    EnterCriticalSection(&cs);
     if (g.autoPokeBack) {
         DWORD now = GetTickCount();
         bool ok;
         int times;
-        EnterCriticalSection(&cs);
         DWORD last = pokeBackCooldown[fromClientID];
         ok = (last == 0) || ((now - last) > 5000);   /* 5s cooldown breaks ping-pong loops */
         if (ok) pokeBackCooldown[fromClientID] = now;
         times = g.autoPokeBackTimes;
-        LeaveCriticalSection(&cs);
-
-        if (ok) pokeTimes(serverConnectionHandlerID, fromClientID, times);
+        if (ok) {
+            DelayedReaction d = {};
+            d.epoch = g_sendWindow.epoch(); d.sch = serverConnectionHandlerID; d.client = fromClientID;
+            d.doPoke = true; d.pokeN = times;
+            scheduleReaction(d);
+        }
     }
+    LeaveCriticalSection(&cs);
     return 0;   /* 0 = let the incoming poke display normally */
 }
 
@@ -1851,6 +2014,7 @@ void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int sta
     DWORD now = GetTickCount();
 
     EnterCriticalSection(&cs);
+    d.epoch = g_sendWindow.epoch();
     d.delayMs = g.talkDelayMs;
     if (talkTargets.count(clientID)) {
         DWORD last = talkCooldown[clientID];
@@ -1896,15 +2060,17 @@ void ts3plugin_onClientSelfVariableUpdateEvent(uint64 sch, int flag, const char*
 
 int ts3plugin_onServerErrorEvent(uint64 sch, const char* message, unsigned int error, const char* code, const char* extra) {
     (void)message; (void)extra;
-    g_directSend.reply(sch, code, error);
-    jobReply(sch, code, error);
+    std::string owner = g_sendWindow.reply(sch, code);
+    g_directSend.reply(sch, owner.c_str(), error);
+    jobReply(sch, owner.c_str(), error);
     return g_talkAudio.serverReply(sch, code, error) ? 1 : 0;
 }
 
 int ts3plugin_onServerPermissionErrorEvent(uint64 sch, const char* message, unsigned int error, const char* code, unsigned int permission) {
     (void)message; (void)permission;
-    g_directSend.reply(sch, code, error);
-    jobReply(sch, code, error);
+    std::string owner = g_sendWindow.reply(sch, code);
+    g_directSend.reply(sch, owner.c_str(), error);
+    jobReply(sch, owner.c_str(), error);
     return g_talkAudio.serverReply(sch, code, error) ? 1 : 0;
 }
 
@@ -1973,8 +2139,9 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int 
     if (newStatus != STATUS_CONNECTION_ESTABLISHED) g_directSend.disconnected(serverConnectionHandlerID);
     if (newStatus == STATUS_DISCONNECTED) {
         EnterCriticalSection(&cs);
-        for (Job* job : {&moveJob, &pokeJob})
-            if (job->sch == serverConnectionHandlerID && job->stopEvent) SetEvent(job->stopEvent);
+        for (Job* job : {&moveJob, &pokeJob, &copyMoveJob, &copyPokeJob})
+            if ((job->sch == serverConnectionHandlerID || std::find(job->senders.begin(), job->senders.end(), serverConnectionHandlerID) != job->senders.end()) && job->stopEvent)
+                SetEvent(job->stopEvent);
         LeaveCriticalSection(&cs);
     }
     if (newStatus == STATUS_DISCONNECTED) g_talkAudio.disconnected(serverConnectionHandlerID);

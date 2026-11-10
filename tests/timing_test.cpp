@@ -8,6 +8,7 @@ namespace {
 std::atomic<int> requests{0}, scans{0};
 int stopAt = 100, rejectAt = 0, replyAt = 0;
 bool noChannels = false;
+bool acknowledge = true;
 uint64 currentChannel = 11, previousDestination = 0;
 Job* activeJob = nullptr;
 std::string config;
@@ -19,7 +20,7 @@ void returnCode(const char*, char* result, size_t size) {
 }
 unsigned int sent(uint64 sch, const char* code) {
     int n = ++requests;
-    if (n == replyAt) ts3plugin_onServerErrorEvent(sch, "flood", ERROR_client_is_flooding, code, "");
+    if (acknowledge) ts3plugin_onServerErrorEvent(sch, "", n == replyAt ? ERROR_client_is_flooding : ERROR_ok, code, "");
     if (n == stopAt) SetEvent(activeJob->stopEvent);
     return n == rejectAt ? ERROR_client_is_flooding : ERROR_ok;
 }
@@ -47,6 +48,8 @@ unsigned int where(uint64, anyID, uint64* result) { *result = currentChannel; re
 void prepare(Job& job, int interval = 0) {
     requests = 0; scans = 0; stopAt = 100; rejectAt = replyAt = 0;
     noChannels = false; currentChannel = 11; previousDestination = 0;
+    acknowledge = true;
+    g_sendWindow.cancelAll();
     job.sch = 1; job.targets = {42}; job.intervalMs = interval; job.limiterMs = 0; job.allChannels = 1;
     activeJob = &job;
 }
@@ -110,6 +113,31 @@ int main() {
     prepare(pokeJob, 60000); stopAt = INT_MAX; launchJob(pokeJob, pokeThread);
     while (!requests.load()) Sleep(1);
     hardStop(); assert(!pokeJob.thread && !pokeJob.active); // Long waits interrupt immediately.
+    prepare(pokeJob); acknowledge = false; stopAt = INT_MAX;
+    launchJob(pokeJob, pokeThread);
+    while (requests.load() < (int)SendWindow::capacity) Sleep(1);
+    Sleep(30); hardStop();
+    assert(requests == (int)SendWindow::capacity && !pokeJob.thread);
+    prepare(pokeJob); acknowledge = false; stopAt = INT_MAX; pokeJob.limiterMs = 60;
+    double limited = run(pokeJob, pokeThread);
+    assert(requests == (int)SendWindow::capacity && limited < 1000);
+    prepare(pokeJob, 60000); stopAt = INT_MAX; pokeJob.limiterMs = 60;
+    assert(run(pokeJob, pokeThread) < 1000 && requests == 1);
+
+    g_shutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    requests = 0; acknowledge = true;
+    DelayedReaction delayed = {};
+    delayed.epoch = g_sendWindow.epoch(); delayed.sch = 1; delayed.client = 42;
+    delayed.delayMs = 200; delayed.doPoke = true; delayed.pokeN = 10;
+    scheduleReaction(delayed); hardStop(); Sleep(250);
+    assert(!requests && !g_reactionsPending.load());
+    scheduleReaction(delayed); assert(!g_reactionsPending.load()); // Stale callback cannot re-arm.
+    g.autoPokeBack = 1; g.autoPokeBackTimes = 100; acknowledge = false;
+    ts3plugin_onClientPokeEvent(1, 42, "", "", "", 0);
+    while (requests.load() < (int)SendWindow::capacity) Sleep(1);
+    hardStop(); assert(!g_reactionsPending.load() && !g.autoPokeBack);
+    assert(requests == (int)SendWindow::capacity);
+    CloseHandle(g_shutdownEvent); g_shutdownEvent = NULL;
 
     // Pool worker and Stop share cs. Repeated cancellation must not join under that lock.
     g.autoCreateTemp = 1; g_tempChannels = {11, 12, 13};

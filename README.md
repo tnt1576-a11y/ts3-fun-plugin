@@ -7,7 +7,8 @@ A client-side plugin for messing with friends on your own TS3 server.
 - **Talk Back** — stream a live pitched echo privately to one person, or back to everyone in your channel as normal voice.
 - **Poke** — keep poking a chosen user with a custom or random message on a timer.
 - **Poke Pack** — choose a count and text, confirm the warning, then send immediately without the Settings timer.
-- **Poke / Message from my copies** — send once to a selected user from each connected copy belonging to your original tab.
+- **Poke / Message from my copies** — choose an amount per connected copy belonging to your original tab.
+- **Poke / Random Move / Chaos from copies: Start / Stop** — continuous actions through your copies, using the Settings intervals and limiter.
 - **HARD STOP** — one click halts everything.
 - **Settings** — native dialog for intervals and messages (saved to `funplugin.ini`).
 
@@ -69,6 +70,7 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 - **Poke: Start / Stop**
 - **Poke Pack...**
 - **Poke from my copies... / Message from my copies...**
+- **Poke / Random Move / Chaos from copies: Start... / Stop**
 - **Chaos (move + poke): Start / Stop** — both at once
 - **Talk-poke: Arm / Disarm** — pokes them every time they start talking
 - **Talk-move: Arm / Disarm** — moves them to another channel every time they start
@@ -95,8 +97,9 @@ delivery. The UI stays responsive and **HARD STOP** cancels requests not yet sub
 
 After making copies, right-click a user on the original tab and choose **Poke from
 my copies...** or **Message from my copies...**. The dialog shows the connected copy
-count. Each of those copies sends the entered text once; your original connection
-does not send. Copies created from another original tab, connecting copies, and
+count. **Amount per sender is editable and means per copy**: 3 copies with an amount
+of 5 submit 15 pokes/messages. Your original connection does not send.
+Copies created from another original tab, connecting copies, and
 unrelated tabs are excluded. Copies that join after the dialog opens are not added.
 Messages are private to the selected user. Unicode text is supported; pokes allow
 100 UTF-8 bytes and private messages 8192 bytes.
@@ -108,6 +111,34 @@ or limit bypass is attempted. Submitted requests cannot be recalled, and server
 errors may arrive after the batch has already been submitted. The result reports
 submitted requests, not confirmed deliveries. **Remove my copies**, **HARD STOP**,
 and unloading the plugin also cancel these sends.
+
+For continuous actions, use **Poke from copies: Start...**, **Random Move from
+copies: Start...**, or **Chaos from copies: Start...**. Start from the original tab
+and select the recipient there. Each round uses the connected copies present when
+you confirm. Intervals and the limiter come from Settings; restart an action after
+changing them. Copy moves use existing channels and the configured empty-channel
+fallback; they do not create temporary channels. The corresponding copy **Stop**
+items stop those actions while leaving the copies connected. **Remove my copies**
+and **HARD STOP** also stop the copy jobs. A changed recipient/server or disconnected
+copy stops its action rather than sending through another tab.
+
+### HARD STOP and pending pokes
+
+HARD STOP now invalidates delayed talk-pokes/talk-moves, stops in-progress
+auto-poke-back, and signals all original/copy workers before waiting for them to
+finish. Old callbacks and open send dialogs cannot restart actions cancelled by
+that stop. A later explicit Start works normally.
+
+At most **8 plugin move/poke/message requests** can await server acknowledgement
+across timed actions, batches and reactions. This prevents maximum-speed mode from
+building an unlimited queue of requests awaiting replies. Sending waits when the
+window is full, and stops if a request remains unanswered for five seconds while full. There is
+no retry or server-limit bypass.
+
+Already submitted commands cannot be recalled, and pokes already delivered can
+remain in the recipient's popup queue after HARD STOP. The plugin cannot clear
+another person's TeamSpeak dialogs. Stop cancels future generation, not those
+existing popups.
 
 ### Make copies of myself
 
@@ -217,7 +248,8 @@ Open **Settings...** for the move/poke intervals, message mode, and:
 
 In **Settings**, set seconds between moves and/or pokes to **`0`** for maximum
 speed. Stop and restart the corresponding action to apply a changed interval.
-Zero removes the plugin's timed pause; workers yield the CPU between rounds and
+Zero removes the plugin's timed pause, subject to the shared 8-request window;
+workers yield the CPU between rounds and
 check Stop between targets. Positive values support **`0.001` seconds** (1 ms).
 Positive waits use a high-resolution Windows timer when supported, with a fallback
 on older systems. SDK work still adds to the configured delay.

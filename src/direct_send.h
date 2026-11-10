@@ -8,13 +8,14 @@
 #include <vector>
 #include "ts3_functions.h"
 #include "teamspeak/public_errors.h"
+#include "send_window.h"
 
 namespace DirectSend {
 struct Request {
     uint64 source = 0;
     anyID target = 0;
     std::vector<uint64> senders;
-    int count = 1; // Per sender; copy actions use exactly one.
+    int count = 1; // Per sender.
     bool privateMessage = false;
     std::string text, serverUID, targetUID;
 };
@@ -33,6 +34,9 @@ inline std::string identity(TS3Functions& api, uint64 sch, anyID client = 0) {
 // One cancellable worker: no configured delay and no blocking send loop on the GUI.
 class Batch {
     TS3Functions& api;
+    SendWindow& window;
+    uint64 epoch = 0;
+    std::string pluginID;
     Request request;
     HANDLE thread = nullptr;
     CRITICAL_SECTION lock;
@@ -52,16 +56,20 @@ class Batch {
         uint64 submitted = 0;
         std::string reason;
         for (uint64 sender : request.senders) {
-            for (int i = 0; i < request.count && !cancelled.load(); ++i) {
+            for (int i = 0; i < request.count && !cancelled.load() && window.epoch() == epoch; ++i) {
                 if (!matches(request.source) || !matches(sender)) {
                     reason = " Connection or recipient changed.";
                     cancelled = true;
                     break;
                 }
                 if (cancelled.load()) break;
-                unsigned int error = request.privateMessage
-                    ? api.requestSendPrivateTextMsg(sender, request.text.c_str(), request.target, returnCode.c_str())
-                    : api.requestClientPoke(sender, request.target, request.text.c_str(), returnCode.c_str());
+                unsigned int error = window.send(epoch, sender, returnCode, pluginID.c_str(),
+                    [&] { return cancelled.load(); }, [&](const char* code) {
+                        if (!matches(request.source) || !matches(sender)) return (unsigned int)ERROR_client_invalid_id;
+                        return request.privateMessage
+                            ? api.requestSendPrivateTextMsg(sender, request.text.c_str(), request.target, code)
+                            : api.requestClientPoke(sender, request.target, request.text.c_str(), code);
+                    });
                 if (error != ERROR_ok && error != ERROR_ok_no_update) {
                     reason = " TeamSpeak rejected a request (error " + std::to_string(error) + ").";
                     cancelled = true;
@@ -69,7 +77,7 @@ class Batch {
                 }
                 ++submitted;
             }
-            if (cancelled.load()) break;
+            if (cancelled.load() || window.epoch() != epoch) { cancelled = true; break; }
         }
         std::string result = "[Fun Plugin] " + std::string(cancelled.load() ? "Send stopped: " : "Send finished: ") +
             std::to_string(submitted) + "/" + std::to_string((uint64)request.count * request.senders.size()) +
@@ -78,7 +86,7 @@ class Batch {
         running = false;
     }
 public:
-    explicit Batch(TS3Functions& functions) : api(functions) { InitializeCriticalSection(&lock); }
+    Batch(TS3Functions& functions, SendWindow& flow) : api(functions), window(flow) { InitializeCriticalSection(&lock); }
     ~Batch() { stop(); DeleteCriticalSection(&lock); }
     bool busy() const { return running.load(); }
     void stop() {
@@ -95,6 +103,8 @@ public:
         if (!code[0]) return false;
         EnterCriticalSection(&lock);
         request = value;
+        pluginID = plugin;
+        epoch = window.epoch();
         returnCode = code;
         cancelled = false;
         running = true;
