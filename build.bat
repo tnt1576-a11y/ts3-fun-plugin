@@ -32,7 +32,7 @@ g++ -shared -m64 -O2 -s ^
     -I "%SDK%" -I "%ROOT%res" ^
     "%ROOT%src\plugin.cpp" "%ROOT%resource.o" ^
     -o "%ROOT%%OUT%" ^
-    -luser32 -lgdi32 -lcomdlg32 -ladvapi32 -lkernel32
+    -luser32 -lgdi32 -lcomdlg32 -ladvapi32 -lkernel32 -lwinmm
 if errorlevel 1 exit /b 1
 
 echo.

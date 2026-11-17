@@ -37,6 +37,8 @@
 #include "copies.h"
 #include "tab_ui.h"
 #include "talk_back.h"
+#include "voice_changer.h"
+#include "voice_preview.h"
 #include "direct_send.h"
 
 /* The SDK header declares ts3plugin_apiVersion() but does not define the number;
@@ -56,7 +58,7 @@ static char*     pluginID  = NULL;          /* our registered plugin id         
 static HINSTANCE hInstance = NULL;          /* DLL instance (for the dialog)     */
 
 #define PLUGIN_NAME    "Fun Plugin"
-#define PLUGIN_VERSION "2.18"
+#define PLUGIN_VERSION "2.20"
 #define PLUGIN_AUTHOR  "kingtnt"
 #define PLUGIN_DESC    "Make copies of yourself, random-move, poke and chaos your friends for fun."
 
@@ -92,7 +94,8 @@ enum {
     MENU_COPIES_MESSAGE,
     MENU_COPIES_POKE_START, MENU_COPIES_POKE_STOP,
     MENU_COPIES_MOVE_START, MENU_COPIES_MOVE_STOP,
-    MENU_COPIES_CHAOS_START, MENU_COPIES_CHAOS_STOP
+    MENU_COPIES_CHAOS_START, MENU_COPIES_CHAOS_STOP,
+    MENU_VOICE_CHANGER, MENU_VOICE_OFF
 };
 
 /* "No empty channel" behaviour */
@@ -121,6 +124,7 @@ struct Settings {
     int  selfLockOn;       /* 0/1: persisted; auto-arms self-lock on every connect */
     int  copyCount;        /* remembered count; never auto-connect on startup */
     TalkBack::Options talkBack;
+    VoiceChanger::Options voiceChanger;
     char customMsg[256];
     char talkPokeMsg[256]; /* dedicated talk-poke text; blank = use poke settings */
     std::vector<std::string> randomMsgs;
@@ -133,6 +137,8 @@ static HWND g_copyWindow = NULL;
 static Copies::Manager* g_copies = NULL;   /* only accessed on the GUI thread */
 static CopyTabUI g_copyTabs;
 static TalkBack::Audio g_talkAudio;
+static VoiceChanger::Audio g_voiceAudio;
+static VoicePreview g_voicePreview;
 static TalkBack::Session* g_talkSession = NULL;
 static std::set<uint64> g_copyHandlers;    /* callback filter, guarded by cs */
 static volatile LONG g_copyOpening = 0;
@@ -261,6 +267,7 @@ static void setDefaults() {
     g.selfLockOn       = 0;
     g.copyCount        = 5;
     g.talkBack         = TalkBack::Options();
+    g.voiceChanger     = VoiceChanger::Options();
     strcpy(g.customMsg, "stop ignoring me!");
     g.talkPokeMsg[0]   = '\0';   /* blank = fall back to poke settings */
     g.randomMsgs.clear();
@@ -308,6 +315,10 @@ static void loadSettings() {
     talkBack.semitones = GetPrivateProfileIntA("talkback", "semitones", talkBack.semitones, ini);
     talkBack.volume = GetPrivateProfileIntA("talkback", "volume", talkBack.volume, ini);
     if (talkBack.valid()) g.talkBack = talkBack;
+    VoiceChanger::Options voice;
+    voice.preset = GetPrivateProfileIntA("voicechanger", "preset", voice.preset, ini);
+    voice.volume = GetPrivateProfileIntA("voicechanger", "volume", voice.volume, ini);
+    if (voice.valid()) g.voiceChanger = voice;
     GetPrivateProfileStringA("poke", "custom", g.customMsg, g.customMsg, sizeof(g.customMsg), ini);
     GetPrivateProfileStringA("react", "talkPokeMsg", g.talkPokeMsg, g.talkPokeMsg, sizeof(g.talkPokeMsg), ini);
 
@@ -367,6 +378,10 @@ static void saveSettings() {
     WritePrivateProfileStringA("talkback", "semitones", num, ini);
     _snprintf(num, sizeof(num), "%d", g.talkBack.volume);
     WritePrivateProfileStringA("talkback", "volume", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.voiceChanger.preset);
+    WritePrivateProfileStringA("voicechanger", "preset", num, ini);
+    _snprintf(num, sizeof(num), "%d", g.voiceChanger.volume);
+    WritePrivateProfileStringA("voicechanger", "volume", num, ini);
 
     _snprintf(num, sizeof(num), "%d", (int)g.randomMsgs.size());
     WritePrivateProfileStringA("poke", "randomCount", num, ini);
@@ -1033,6 +1048,8 @@ static void stopAllJobs() {
  * Auto-poke-back is turned off for the session (re-enable it in Settings);
  * all talk-poke arming is cleared. */
 static void hardStop() {
+    g_voicePreview.stop();
+    g_voiceAudio.stop();
     EnterCriticalSection(&cs);
     g_sendWindow.cancelAll();
     talkTargets.clear();      /* disarm every talk-poke target */
@@ -1047,7 +1064,7 @@ static void hardStop() {
     if (g_copies) g_copies->stopAll();
     ts3Functions.printMessageToCurrentTab(
         "[Fun Plugin] HARD STOP: copy queue cancelled and copies disconnected; all jobs stopped, "
-        "Talk Back stopped, pending reactions cancelled, auto-poke-back off. Already delivered pokes cannot be recalled.");
+        "Talk Back and Voice Changer stopped, pending reactions cancelled, auto-poke-back off. Already delivered pokes cannot be recalled.");
 }
 
 static std::vector<anyID> one(anyID c) { return std::vector<anyID>(1, c); }
@@ -1609,6 +1626,92 @@ static void openCopies(uint64 sch, uint64 channel) {
     } else ts3Functions.printMessageToCurrentTab("[Fun Plugin] Could not start the copy queue. Check your original connection.");
 }
 
+struct VoiceDialog { VoiceChanger::Options options; bool active = false; };
+static void updatePreviewControls(HWND dialog) {
+    auto state = g_voicePreview.state;
+    EnableWindow(GetDlgItem(dialog, IDC_VC_RECORD), state != VoicePreview::Recording && state != VoicePreview::Playing);
+    EnableWindow(GetDlgItem(dialog, IDC_VC_PLAY), state == VoicePreview::Ready);
+    SetDlgItemTextW(dialog, IDC_VC_PREVIEW_STATUS, state == VoicePreview::Recording ? L"Recording 5 seconds... speak now. Server microphone is suppressed." :
+        state == VoicePreview::Playing ? L"Playing locally. Server microphone is suppressed." :
+        state == VoicePreview::Ready ? L"Clip ready. Choose any voice, then Play back. Normal chat resumes." : L"Record uses your Windows default microphone. Playback uses default output.");
+}
+static INT_PTR CALLBACK voiceChangerProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    VoiceDialog* data = (VoiceDialog*)GetWindowLongPtrW(dialog, DWLP_USER);
+    if (message == WM_INITDIALOG) {
+        data = (VoiceDialog*)lParam;
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        for (int i = 0; i < VoiceChanger::Count; ++i)
+            SendDlgItemMessageW(dialog, IDC_VC_PRESET, CB_ADDSTRING, 0, (LPARAM)VoiceChanger::name(i));
+        SendDlgItemMessageW(dialog, IDC_VC_PRESET, CB_SETCURSEL, data->options.preset, 0);
+        SetDlgItemTextW(dialog, IDC_VC_DESCRIPTION, VoiceChanger::description(data->options.preset));
+        SetDlgItemTextW(dialog, IDC_VC_STATUS, data->active ? L"Voice Changer is ON. Apply switches to this tab and preset." : L"Voice Changer is OFF. Apply enables it on this server tab.");
+        setDlgInt(dialog, IDC_VC_VOLUME, data->options.volume);
+        updatePreviewControls(dialog); SetTimer(dialog, 2, 100, nullptr);
+        return TRUE;
+    }
+    if (message == WM_TIMER && wParam == 2) { g_voicePreview.tick(); updatePreviewControls(dialog); return TRUE; }
+    if (message == WM_DESTROY) { KillTimer(dialog, 2); g_voicePreview.stop(); return TRUE; }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDC_VC_RECORD) {
+        if (!g_voicePreview.record()) MessageBoxW(dialog, L"Cannot open the Windows default microphone. Check Windows microphone access and your default input device.", L"Voice test", MB_OK | MB_ICONINFORMATION);
+        updatePreviewControls(dialog); return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDC_VC_PLAY) {
+        VoiceChanger::Options selected;
+        selected.preset = (int)SendDlgItemMessageW(dialog, IDC_VC_PRESET, CB_GETCURSEL, 0, 0);
+        selected.volume = (int)GetDlgItemInt(dialog, IDC_VC_VOLUME, nullptr, FALSE);
+        if (!selected.valid() || !g_voicePreview.play(selected)) MessageBoxW(dialog, L"Choose a valid voice and volume (10-100%). Check your Windows default playback device.", L"Voice test", MB_OK | MB_ICONINFORMATION);
+        updatePreviewControls(dialog); return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDC_VC_PREVIEW_STOP) {
+        g_voicePreview.stop(); updatePreviewControls(dialog); return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDC_VC_PRESET && HIWORD(wParam) == CBN_SELCHANGE) {
+        int preset = (int)SendDlgItemMessageW(dialog, IDC_VC_PRESET, CB_GETCURSEL, 0, 0);
+        SetDlgItemTextW(dialog, IDC_VC_DESCRIPTION, VoiceChanger::description(preset));
+        return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDC_VC_OFF) {
+        g_voiceAudio.stop(); EndDialog(dialog, IDCANCEL); return TRUE;
+    }
+    if (message == WM_COMMAND && LOWORD(wParam) == IDOK && data) {
+        VoiceChanger::Options selected;
+        selected.preset = (int)SendDlgItemMessageW(dialog, IDC_VC_PRESET, CB_GETCURSEL, 0, 0);
+        selected.volume = (int)GetDlgItemInt(dialog, IDC_VC_VOLUME, NULL, FALSE);
+        if (!selected.valid()) {
+            MessageBoxW(dialog, L"Choose a voice and a volume from 10 to 100%.", L"Voice Changer", MB_OK | MB_ICONINFORMATION);
+            return TRUE;
+        }
+        data->options = selected; EndDialog(dialog, IDOK); return TRUE;
+    }
+    if ((message == WM_COMMAND && LOWORD(wParam) == IDCANCEL) || message == WM_CLOSE) {
+        EndDialog(dialog, IDCANCEL); return TRUE;
+    }
+    return FALSE;
+}
+
+static bool voiceConnectionReady(uint64 sch) {
+    int status = STATUS_DISCONNECTED;
+    return sch && !isCopyConnection(sch) && ts3Functions.getConnectionStatus &&
+        ts3Functions.getConnectionStatus(sch, &status) == ERROR_ok && status == STATUS_CONNECTION_ESTABLISHED;
+}
+static void openVoiceChanger(uint64 sch) {
+    if (g_talkSession && g_talkSession->active()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Stop Talk Back before enabling Voice Changer."); return;
+    }
+    uint64 generation = g_voiceAudio.generation();
+    VoiceDialog data; data.options = g.voiceChanger; data.active = g_voiceAudio.active();
+    if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_VOICE_CHANGER), GetForegroundWindow(), voiceChangerProc, (LPARAM)&data) != IDOK) return;
+    if (!voiceConnectionReady(sch) || (g_talkSession && g_talkSession->active()) ||
+        !g_voiceAudio.start(sch, data.options, generation)) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Voice Changer was not applied because the connection or audio session changed. Open it again to start."); return;
+    }
+    g.voiceChanger = data.options; saveSettings();
+    std::wstring label = VoiceChanger::name(data.options.preset);
+    std::string message = "[Fun Plugin] Voice Changer ON: " + std::string(label.begin(), label.end()) +
+        ". Speak with your normal microphone controls. Voice Changer: OFF or HARD STOP restores your voice.";
+    ts3Functions.printMessageToCurrentTab(message.c_str());
+}
+
 struct TalkBackDialog { TalkBack::Options options; std::wstring name; bool channel = false; };
 static INT_PTR CALLBACK talkBackProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
     TalkBackDialog* data = (TalkBackDialog*)GetWindowLongPtrW(dialog, DWLP_USER);
@@ -1647,6 +1750,9 @@ static INT_PTR CALLBACK talkBackProc(HWND dialog, UINT message, WPARAM wParam, L
 }
 
 static void openTalkBack(uint64 sch, anyID client, bool channelMode = false, uint64 selectedChannel = 0) {
+    if (g_voiceAudio.active()) {
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Turn Voice Changer OFF before starting Talk Back."); return;
+    }
     if (isCopyConnection(sch) || !ensureCopyQueue()) {
         ts3Functions.printMessageToCurrentTab("[Fun Plugin] Start Talk Back from your original connected server tab."); return;
     }
@@ -1682,7 +1788,9 @@ static void openTalkBack(uint64 sch, anyID client, bool channelMode = false, uin
             data.name = copyWide(name);
         if (data.name.empty()) data.name = L"Selected user";
     }
+    uint64 epoch = g_sendWindow.epoch();
     if (DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_TALKBACK), GetForegroundWindow(), talkBackProc, (LPARAM)&data) != IDOK) return;
+    if (epoch != g_sendWindow.epoch() || g_voiceAudio.active()) return;
     bool started = channelMode ? g_talkSession->startChannel(sch, channel, data.options, GetTickCount64())
         : g_talkSession->start(sch, client, uid, data.options, GetTickCount64());
     if (started) {
@@ -1727,6 +1835,8 @@ int ts3plugin_init() {
 }
 
 void ts3plugin_shutdown() {
+    g_voicePreview.stop();
+    g_voiceAudio.stop();
     g_sendWindow.cancelAll();
     stopAllJobs();
     g_directSend.stop();
@@ -1795,7 +1905,7 @@ void ts3plugin_freeMemory(void* data) {
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const int count = 34;
+    const int count = 36;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     int n = 0;
     /* Right-click a USER */
@@ -1835,6 +1945,8 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_COPIES_REMOVE,  "Remove my copies (cancel queue)");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_TALKBACK_STOP_ALL, "Talk Back: Stop");
     (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_TALKBACK_CHANNEL, "Talk Back: Channel...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_VOICE_CHANGER, "Voice Changer...");
+    (*menuItems)[n++] = mkItem(PLUGIN_MENU_TYPE_GLOBAL,  MENU_VOICE_OFF, "Voice Changer: OFF");
     (*menuItems)[n++] = NULL;
 
     *menuIcon = NULL;
@@ -1846,6 +1958,14 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
     uint64 channelTarget = selectedItemID;          /* CHANNEL menus */
 
     switch (menuItemID) {
+    case MENU_VOICE_CHANGER:
+        if (type == PLUGIN_MENU_TYPE_GLOBAL) openVoiceChanger(serverConnectionHandlerID);
+        break;
+    case MENU_VOICE_OFF:
+        g_voicePreview.stop();
+        g_voiceAudio.stop();
+        ts3Functions.printMessageToCurrentTab("[Fun Plugin] Voice Changer OFF - normal microphone voice restored.");
+        break;
     case MENU_COPIES_POKE_START:
     case MENU_COPIES_MOVE_START:
     case MENU_COPIES_CHAOS_START:
@@ -2073,12 +2193,21 @@ void ts3plugin_onEditPlaybackVoiceDataEvent(uint64 sch, anyID client, short* sam
 }
 
 void ts3plugin_onEditCapturedVoiceDataEvent(uint64 sch, short* samples, int count, int channels, int* edited) {
-    g_talkAudio.captured(sch, samples, count, channels, edited);
+    if (g_voicePreview.suppressTransmission()) {
+        if (edited) *edited &= ~2;
+        g_voiceAudio.clearCapture(sch);
+        return;
+    }
+    if (g_talkAudio.captureConnection.load() == sch)
+        g_talkAudio.captured(sch, samples, count, channels, edited);
+    else g_voiceAudio.captured(sch, samples, count, channels, edited);
 }
 
 void ts3plugin_onClientSelfVariableUpdateEvent(uint64 sch, int flag, const char* oldValue, const char* newValue) {
     (void)oldValue;
     g_talkAudio.selfUpdate(sch, flag, newValue);
+    if ((flag == CLIENT_INPUT_MUTED || flag == CLIENT_INPUT_DEACTIVATED || flag == CLIENT_INPUT_HARDWARE) &&
+        newValue && oldValue && strcmp(oldValue, newValue) != 0) g_voiceAudio.clearCapture(sch);
 }
 
 int ts3plugin_onServerErrorEvent(uint64 sch, const char* message, unsigned int error, const char* code, const char* extra) {
@@ -2159,6 +2288,7 @@ void ts3plugin_onClientKickFromServerEvent(uint64 serverConnectionHandlerID, any
  * (set by onClientKickFromServerEvent) to tell them apart. */
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus,
                                           unsigned int errorNumber) {
+    if (newStatus != STATUS_CONNECTION_ESTABLISHED) g_voiceAudio.disconnected(serverConnectionHandlerID);
     if (newStatus != STATUS_CONNECTION_ESTABLISHED) g_directSend.disconnected(serverConnectionHandlerID);
     if (newStatus == STATUS_DISCONNECTED) {
         EnterCriticalSection(&cs);

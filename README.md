@@ -5,6 +5,7 @@ A client-side plugin for messing with friends on your own TS3 server.
 - **Random Move** — keep moving a chosen user into a random *empty* channel on a timer.
 - **Make copies of myself** — enter how many extra connections to join, in ordinary TS3 tabs.
 - **Talk Back** — stream a live pitched echo privately to one person, or back to everyone in your channel as normal voice.
+- **Voice Changer** — change your own microphone with nine fun presets, volume control, and one-click OFF.
 - **Poke** — keep poking a chosen user with a custom or random message on a timer.
 - **Poke Pack** — choose a count and text, confirm the warning, then send immediately without the Settings timer.
 - **Poke / Message from my copies** — choose an amount per connected copy belonging to your original tab.
@@ -85,6 +86,53 @@ In TeamSpeak: **Tools → Options → Addons**, reload the list, enable **Fun Pl
 
 **Global plugin menu:** **Settings...**, **HARD STOP - stop everything**,
 **Self-lock: ON / OFF**, **Make copies of myself...**, and **Remove my copies (cancel queue)**.
+
+### Voice Changer (v2.20)
+
+Open **Plugins → Fun Plugin → Voice Changer...** on your original connected
+server tab. Choose a voice and output volume (10–100%), then **Apply voice**.
+Speak using your normal microphone controls. To change presets, open the dialog
+again and apply another voice. **Cancel** leaves the current effect alone.
+
+| Preset | Effect |
+| --- | --- |
+| Auto-tune (hard tune) | Fast pitch snapping to C major pentatonic (C, D, E, G, A) for a stronger effect. |
+| Robot | Metallic ring modulation. |
+| Female (bright pitch) | Five semitones higher with a brighter tone. |
+| Deep | Seven semitones lower. |
+| Baby | Nine semitones higher with a gentle pitch wobble. |
+| Chipmunk | One octave higher. |
+| Demon | Ten semitones lower with a rumbling modulation. |
+| Alien | Higher pitch with warbling ring modulation. |
+| Radio | Narrow-band, lightly distorted walkie-talkie sound. |
+
+These are local DSP effects. Female and Baby are playful pitch/tone presets,
+not realistic AI voice conversion. Auto-tune is a basic hard pitch-correction
+effect, not the Antares product; it has no musical key selection. Detection targets
+voiced fundamentals around 60–500 Hz and leaves unvoiced sounds uncorrected.
+Speech may have a subtler effect than sustained singing. Pitch effects add a short
+processing delay (up to about 44 ms); tuning also needs roughly 40 ms of voice to
+begin detecting notes. No recording files, uploads, virtual audio driver, or extra
+TeamSpeak connection are required. Multichannel microphone input is mixed to mono.
+
+**Voice Changer: OFF**, the dialog's **Turn OFF**, or **HARD STOP** restores your
+normal microphone voice. A disconnect or plugin unload turns it off too. Preset
+and volume are remembered in `funplugin.ini`, but activation is never saved.
+One server tab at a time is affected; applying on another original tab moves the
+effect there. Other tabs and plugin-created copies are untouched.
+
+Mute, push-to-talk, voice activation, and whisper routing remain under TeamSpeak's
+control. The effect never opens the microphone or forces transmission. Buffered
+audio is cleared when capture reports that transmission is disabled. Use **Record 5 seconds**, then **Play back** to hear the effect locally.
+Recording uses the Windows default microphone, even while TeamSpeak is muted;
+playback uses the Windows default output. Normal server microphone transmission
+is suppressed during recording and playback, then resumes automatically. This test
+works without applying the effect or connecting to a server. The clip stays only in
+memory: change presets and replay it, or use **Stop / clear test** to discard it.
+Closing the dialog, applying a voice, OFF, and HARD STOP stop and clear the test.
+**Talk Back and Voice Changer are mutually exclusive**: stop one before starting
+the other. Offline synthetic-audio and lifecycle tests cover the effects; sound
+quality and real microphone/server behavior still need a live listening check.
 
 ### Poke Pack and sending from copies
 

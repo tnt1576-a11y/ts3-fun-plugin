@@ -40,16 +40,25 @@ def inspect_dialog(dll, preview, resource=101, channel=False, copies=False):
         controls = {100: (1001, 1010, 1020, 1, 2),
                     101: (1200, 1201, 1202, 1203, 1, 2),
                     102: (1210, 1211, 1212, 1213, 1215, 1216, 1217, 1, 2),
-                    103: (1220, 1221, 1222, 1223, 1, 2)}[resource]
+                    103: (1220, 1221, 1222, 1223, 1, 2),
+                    104: (1230, 1231, 1232, 1233, 1234, 1235, 1236, 1237, 1238, 1, 2)}[resource]
         for control in controls:
             assert user.GetDlgItem(window, control), f"Missing dialog control {control}"
         values = {100: ((1001, "0"), (1010, "0.001")),
                   101: ((1200, "5"), (1201, "Player"), (1202, "test password"), (1203, "Lobby / Party channel")),
                   102: ((1210, "Selected friend"), (1213, "6"), (1215, "75")),
                   103: ((1220, "Selected friend"), (1221, "25"), (1222, "Hello!"),
-                        (1223, "Send this many pokes immediately, without the Settings timer.\nHARD STOP cancels requests that have not been submitted."))}[resource]
+                        (1223, "Send this many pokes immediately, without the Settings timer.\nHARD STOP cancels requests that have not been submitted.")),
+                  104: ((1231, "80"), (1238, "Record uses your Windows default microphone. Playback uses default output."), (1232, "Fast note snapping to C major pentatonic for a stronger singing effect. Hold a vowel or slide your pitch to hear the steps."),
+                        (1233, "Voice Changer is OFF. Apply enables it on this server tab."))}[resource]
         for control, value in values:
             assert user.SetDlgItemTextW(window, control, value)
+        if resource == 104:
+            user.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+            combo = user.GetDlgItem(window, 1230)
+            label = c.create_unicode_buffer("Auto-tune (hard tune)")
+            user.SendMessageW(combo, 0x143, 0, c.addressof(label))  # CB_ADDSTRING
+            user.SendMessageW(combo, 0x14E, 0, 0)  # CB_SETCURSEL
         if copies:
             assert user.SetWindowTextW(window, "Fun Plugin - Message from my copies")
             assert user.SetDlgItemTextW(window, 1221, "7")
@@ -107,6 +116,8 @@ def inspect_dialog(dll, preview, resource=101, channel=False, copies=False):
                 name = "settings-dialog" if resource == 100 else "direct-send-dialog" if resource == 103 else "copies-dialog" if resource == 101 else "channel-talk-back-dialog" if channel else "talk-back-dialog"
                 if copies:
                     name = "copy-send-dialog"
+                if resource == 104:
+                    name = "voice-changer-dialog"
                 output = ROOT / f"tests/bin/{name}.png"
                 output.parent.mkdir(exist_ok=True)
                 Image.frombytes("RGB", (width, height), pixels.raw, "raw", "BGRX").save(output)
@@ -123,7 +134,7 @@ def main():
     with zipfile.ZipFile(ROOT / "dist/ts3-fun-plugin.ts3_plugin") as archive:
         assert archive.namelist() == ["package.ini", "plugins/funplugin_win64.dll"]
         assert archive.testzip() is None
-        assert b"Version = 2.18" in archive.read("package.ini")
+        assert b"Version = 2.20" in archive.read("package.ini")
         binary = archive.read("plugins/funplugin_win64.dll")
         assert binary == (ROOT / "funplugin_win64.dll").read_bytes()
 
@@ -145,7 +156,7 @@ def main():
         initialized = False
         try:
             dll.ts3plugin_version.restype = c.c_char_p
-            assert dll.ts3plugin_version() == b"2.18"
+            assert dll.ts3plugin_version() == b"2.20"
             assert dll.ts3plugin_apiVersion() == 26
             config = (temporary + "\\").encode("utf-8") + b"\0"
 
@@ -166,13 +177,15 @@ def main():
             dll.ts3plugin_freeMemory.argtypes = [c.c_void_p]
             dll.ts3plugin_initMenus(c.byref(menus), c.byref(icon))
             labels = []
-            for i in range(35):
+            for i in range(37):
                 if not menus[i]:
                     break
                 labels.append(menus[i].contents.text.decode())
                 dll.ts3plugin_freeMemory(menus[i])
             dll.ts3plugin_freeMemory(menus)
-            assert len(labels) == 34
+            assert len(labels) == 36
+            assert "Voice Changer..." in labels
+            assert "Voice Changer: OFF" in labels
             for action in ("Poke", "Random Move", "Chaos"):
                 assert f"{action} from copies: Start..." in labels
                 assert f"{action} from copies: Stop" in labels
@@ -193,12 +206,13 @@ def main():
             inspect_dialog(dll, "--preview" in sys.argv, 103)
             inspect_dialog(dll, "--preview" in sys.argv, 103, copies=True)
             inspect_dialog(dll, "--preview" in sys.argv, 100)
+            inspect_dialog(dll, "--preview" in sys.argv, 104)
         finally:
             if initialized:
                 dll.ts3plugin_shutdown()
             kernel.FreeLibrary.argtypes = [w.HMODULE]
             assert kernel.FreeLibrary(dll._handle)
-    print("PASS: exact packaged DLL loads, API/version, lifecycle, 34 menus, audio exports, native dialogs, archive integrity")
+    print("PASS: exact packaged DLL loads, API/version, lifecycle, 36 menus, audio exports, native dialogs, archive integrity")
     print("DLL SHA-256:", hashlib.sha256(binary).hexdigest())
 
 

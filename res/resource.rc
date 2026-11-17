@@ -99,6 +99,27 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 231, 140, 55, 14
 END
 
+IDD_VOICE_CHANGER DIALOGEX 0, 0, 320, 260
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Fun Plugin - Voice Changer"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_VC_STATUS, 12, 12, 296, 22
+    LTEXT           "Voice:", -1, 12, 41, 42, 10
+    COMBOBOX        IDC_VC_PRESET, 66, 38, 242, 144, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_VC_DESCRIPTION, 12, 63, 296, 30
+    LTEXT           "Output volume (10-100%):", -1, 12, 103, 170, 10
+    EDITTEXT        IDC_VC_VOLUME, 220, 100, 60, 14, ES_NUMBER | WS_TABSTOP
+    LTEXT           "Changes your microphone on this tab. Mute, push-to-talk and voice activation work as usual. Stop Talk Back before using it.\nPreset and volume are remembered; the effect starts OFF.", -1, 12, 127, 296, 40
+    PUSHBUTTON      "Record 5 seconds", IDC_VC_RECORD, 12, 174, 92, 16
+    PUSHBUTTON      "Play back", IDC_VC_PLAY, 114, 174, 85, 16
+    PUSHBUTTON      "Stop / clear test", IDC_VC_PREVIEW_STOP, 209, 174, 99, 16
+    LTEXT           "", IDC_VC_PREVIEW_STATUS, 12, 196, 296, 28
+    PUSHBUTTON      "Turn OFF", IDC_VC_OFF, 12, 236, 65, 14
+    DEFPUSHBUTTON   "Apply voice", IDOK, 165, 236, 78, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 251, 236, 57, 14
+END
+
 IDD_COPIES DIALOGEX 0, 0, 300, 164
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Fun Plugin - Make copies of myself"

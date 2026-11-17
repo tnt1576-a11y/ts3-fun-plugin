@@ -21,6 +21,12 @@
 #define IDC_SEND_COUNT      1221
 #define IDC_SEND_TEXT       1222
 #define IDC_SEND_HELP       1223
+#define IDD_VOICE_CHANGER   104
+#define IDC_VC_PRESET       1230
+#define IDC_VC_VOLUME       1231
+#define IDC_VC_DESCRIPTION  1232
+#define IDC_VC_STATUS       1233
+#define IDC_VC_OFF          1234
 
 /* Move settings */
 #define IDC_MOVE_INTERVAL   1001  /* edit: seconds between moves          */
@@ -57,3 +63,8 @@
 #define IDC_LBL_REACT       1103
 
 #endif /* FUNPLUGIN_RESOURCE_H */
+
+#define IDC_VC_RECORD 1235
+#define IDC_VC_PLAY 1236
+#define IDC_VC_PREVIEW_STOP 1237
+#define IDC_VC_PREVIEW_STATUS 1238
